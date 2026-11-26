@@ -39,7 +39,9 @@ RECORD_KEYS = ["format", "tool", "archive_sha256", "toolchain", "mathlib_rev", "
 NAME_KEYS = ["display_name"]                    # only when the volunteer chose one (`name`)
 LEVEL_KEYS = ["export_sha256", "export_bytes", "checkers", "sign_statement"]   # Levels 2-3 and the joint statement
 PROGRESS_KEYS = ["export_progress"]           # how far `export` got: shown on the leaderboard while it runs
-OPTIONAL_KEYS = NAME_KEYS + LEVEL_KEYS + PROGRESS_KEYS
+CRASH_KEYS = ["crashes"]                       # Lean crashes during the build: which module, so we learn why
+OPTIONAL_KEYS = NAME_KEYS + LEVEL_KEYS + PROGRESS_KEYS + CRASH_KEYS
+CRASHES_MAX = 20
 EXPORT_PROGRESS_FIELDS = ["bytes", "seconds", "left_seconds", "peak_memory_gb", "done"]
 EXPORT_STALE = 1800                             # an unfinished export not heard from in 30 min is dropped from records
 # Level 2: the raw proof export (lean4export, NDJSON) reproduces the reference made by Andrew Sutherland
@@ -88,9 +90,12 @@ DISK_CHECK_SECONDS = float(os.environ.get("RAH_DISK_CHECK_SECONDS", "30"))
 AUTOSUBMIT_SECONDS = float(os.environ.get("RAH_AUTOSUBMIT_SECONDS", "600"))   # default; `submit --interval` overrides
 MIN_INTERVAL = 30                 # shortest auto-submit interval (seconds)
 TIMES_ONLY_SECONDS = 300          # an update that only changes `recorded`/`busy_seconds` is pushed at most this often
+BUILD_RETRIES = 3                                                  # a crashed `lake build` is restarted this often
+BUILD_RETRY_WAIT = float(os.environ.get("RAH_BUILD_RETRY_WAIT", "30"))   # seconds between (testing: shorter)
 AUTOSUBMIT = os.environ.get("RAH_AUTOSUBMIT", "dry-run")   # dry-run | off. Real PRs are not enabled in this build.
 USER_AGENT = TOOL.replace(" ", "/")
 UPSTREAM = "riemann-at-home/riemann-at-home"   # where build records go (one PR per computer)
+SITE_URL = "https://riemann-at-home.github.io/riemann-at-home/"   # the leaderboard and how to join
 AUDIT_LEAN = """import Main
 
 #print axioms riemannHypothesis
@@ -101,6 +106,65 @@ AUDIT_LEAN = """import Main
 """
 IS_MAC = platform.system() == "Darwin"
 
+# ---------------------------------------------------------------- the proofs (CONTRACT "Several proofs")
+# One entry per proof. Records say which proof with "proof"; absent means "17m", so every 17M record, folder and
+# ~/.riemann-at-home from before the 300K proof is unchanged. A future proof is one more entry here (and in the bot).
+# "state": where this proof's per-computer files live under ~/.riemann-at-home ("" = the top, as before):
+# build_id, logs/, records/, config.json (its PR, levels). Consent, display name and submit settings are the
+# person's, shared by every proof (SHARED_KEYS), and so is the tool's clone of the repo (repo/).
+GRH_COMMIT = "72fead102f663d5c7a407964a13dc0cf9d977207"     # github.com/lsernau/grh-lean main, 2026-11-25
+GRH_TREE = "2e133df63d7f4da6b3059c4195324f8e9187ba73"       # its grh/ folder (git tree), checked after checkout
+PROOFS = {
+    "17m": {"key": "17m", "label": "17M", "name": "the original proof", "n": N_MODULES,
+            "toolchain": TOOLCHAIN, "mathlib_rev": MATHLIB_REV, "folders": FIXED_FOLDERS,
+            "source_field": "archive_sha256", "source": ARCHIVE_SHA256,
+            "target": "Main",                 # `lake build Main`
+            "theorems": ["riemannHypothesis"],   # whose axioms the record carries (the audit prints all five)
+            "state": "", "levels": True, "whole_gb": WHOLE_BUILD_GB,
+            "takes": "about 2 days on a fast computer (a week or more on a laptop)"},
+    # grh-lean by Luke Sernau (Apache-2.0), its readable edition: the grh/ folder of the pinned commit.
+    "300k": {"key": "300k", "label": "300K", "name": "the new proof", "n": 803,
+             "toolchain": "leanprover/lean4:v4.35.0", "mathlib_rev": "56a005855ea17e0b0958f73ec801ae140b0a1679",
+             "folders": {"Darwin": "/Users/Shared/riemann-at-home/grh", "Linux": "/opt/riemann-at-home/grh"},
+             "source_field": "source_commit", "source": GRH_COMMIT,
+             "repo": "https://github.com/lsernau/grh-lean", "subdir": "grh", "tree": GRH_TREE,
+             # sha256 of the 803 module names (src/**/*.lean, sorted byte-wise, one per line): bot/modules-300k.txt
+             "modules_sha256": "f0b574a8ad08e8049f098971f03e5cc3087ffb23e2d9f9692a389ccb924813d1",
+             "target": None,                  # plain `lake build`: the edition's default targets (Lib, New, Main)
+             "audit": "scripts/PrintAxioms.lean",   # its own axiom check; must say exactly AUDIT_LEAN
+             "theorems": ["riemannHypothesis", "riemannZeta_eq_zero_re", "LFunction_ne_zero_of_half_lt_re",
+                          "LFunction_eq_zero_re", "LFunction_eq_zero_re_of_isPrimitive"],
+             "state": "300k", "levels": False, "whole_gb": 25, "takes": "20 min to 2 h on most computers"},
+}
+DEFAULT_PROOF = "17m"                 # what a record, a folder or a command means when it does not say
+SHARED_KEYS = ("consent", "display", "submit", "proofs", "repo")   # the person's choices, not one build's
+LEVELS_ONLY_17M = ("export, recheck and sign are for the 17M proof only: the 300K proof has no reference export yet, "
+                   "so a whole 300K build whose five theorems use only the three standard axioms is its finish.")
+
+
+def proof_of_folder(folder: Path):
+    """Which proof a build folder holds: one of the fixed folders, else the one its lean-toolchain pins; or None."""
+    for pk, P in PROOFS.items():
+        if str(folder) in P["folders"].values():
+            return pk
+    try:
+        tc = (folder / "lean-toolchain").read_text().strip()
+    except OSError:
+        return None
+    hits = [pk for pk, P in PROOFS.items() if P["toolchain"] == tc]
+    return hits[0] if len(hits) == 1 else None
+
+
+def chosen_proof(base: Path) -> str:
+    """The proof a command means when it does not say: the one setup chose for this computer (the first not yet
+    finished, for "both"), else 17M, so a computer set up before the 300K proof keeps working exactly as before."""
+    try:
+        ch = json.loads((base / "config.json").read_text()).get("proofs") or {}
+    except (OSError, ValueError):
+        ch = {}
+    act = ch.get("active") if isinstance(ch, dict) else None
+    return act if act in PROOFS else DEFAULT_PROOF
+
 
 class Fail(Exception):
     pass
@@ -108,17 +172,24 @@ class Fail(Exception):
 
 # ---------------------------------------------------------------- paths and small helpers
 
-def fixed_folder() -> Path:
-    f = FIXED_FOLDERS.get(platform.system())
+def fixed_folder(proof: str = DEFAULT_PROOF) -> Path:
+    f = PROOFS[proof]["folders"].get(platform.system())
     if not f:
         raise Fail(f"no fixed build folder defined for {platform.system()} yet (macOS and Linux only)")
     return Path(f)
 
 
 class Ctx:
-    def __init__(self, a):
-        self.home = Path(os.environ.get("RAH_HOME") or Path.home() / ".riemann-at-home")
-        self.folder = Path(a.folder) if getattr(a, "folder", None) else fixed_folder()
+    def __init__(self, a, proof: str = None):
+        self.base = Path(os.environ.get("RAH_HOME") or Path.home() / ".riemann-at-home")   # the person's files
+        pk = proof or getattr(a, "proof", None)
+        if pk not in PROOFS and getattr(a, "folder", None):
+            pk = proof_of_folder(Path(a.folder))      # e.g. a supervisor started by an older version (no --proof)
+        self.proof = pk if pk in PROOFS else chosen_proof(self.base)
+        self.p = PROOFS[self.proof]
+        self.home = self.base / self.p["state"] if self.p["state"] else self.base           # this proof's build
+        self.base_config = self.base / "config.json"
+        self.folder = Path(a.folder) if getattr(a, "folder", None) else fixed_folder(self.proof)
         self.logs = Path(a.logs) if getattr(a, "logs", None) else self.home / "logs"
         self.records = self.home / "records"
         self.status = self.logs / "status.txt"
@@ -140,16 +211,43 @@ class Ctx:
         self.build_id_file.write_text(b + "\n")
         return b
 
-    def conf(self) -> dict:
+    @staticmethod
+    def _load(p: Path) -> dict:
         try:
-            return json.loads(self.config.read_text())
+            d = json.loads(p.read_text())
+            return d if isinstance(d, dict) else {}
         except (OSError, ValueError):
             return {}
 
+    def conf(self) -> dict:
+        """This build's config.json, plus the person's shared choices (SHARED_KEYS) from the top config.json."""
+        own = self._load(self.config)
+        if self.config == self.base_config:
+            return own
+        shared = self._load(self.base_config)
+        return {**{k: v for k, v in own.items() if k not in SHARED_KEYS},
+                **{k: shared[k] for k in SHARED_KEYS if k in shared}}
+
     def set_conf(self, **kw):
-        c = {**self.conf(), **kw}
-        self.home.mkdir(parents=True, exist_ok=True)
-        self.config.write_text(json.dumps(c, indent=1) + "\n")
+        def write(p: Path, upd: dict):
+            if upd:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(json.dumps({**self._load(p), **upd}, indent=1) + "\n")
+        if self.config == self.base_config:
+            return write(self.config, kw)
+        write(self.base_config, {k: v for k, v in kw.items() if k in SHARED_KEYS})
+        write(self.config, {k: v for k, v in kw.items() if k not in SHARED_KEYS})
+
+    def me(self) -> list:
+        """This script, for a background command about this same proof (with RAH_HOME = self.env())."""
+        return [sys.executable, "-I", str(Path(__file__).resolve())]
+
+    def pargs(self) -> list:
+        """--proof for a command started from this one, so it works on the same proof whatever setup chose."""
+        return ["--proof", self.proof]
+
+    def env(self) -> dict:
+        return {**os.environ, "RAH_HOME": str(self.base)}
 
     @property
     def lib(self) -> Path:
@@ -383,14 +481,26 @@ def busy_seconds(ctx: Ctx, running: bool, now: float = None) -> tuple:
     return started, int(round(total))
 
 
-def parse_axioms(text: str):
-    """The axioms Lean prints for riemannHypothesis, or None if the check did not print them."""
-    m = re.search(r"'riemannHypothesis' depends on axioms:\s*\[([^\]]*)\]", text)
+def parse_axioms(text: str, theorem: str = "riemannHypothesis"):
+    """The axioms Lean prints for `theorem`, or None if the check did not print them."""
+    m = re.search(rf"'{re.escape(theorem)}' depends on axioms:\s*\[([^\]]*)\]", text)
     if m:
         return [a.strip() for a in m[1].split(",") if a.strip()]
-    if re.search(r"'riemannHypothesis' does not depend on any axioms", text):
+    if re.search(rf"'{re.escape(theorem)}' does not depend on any axioms", text):
         return []
     return None
+
+
+def proof_axioms(ctx, text: str):
+    """The axioms a record carries: those of every theorem the proof counts, together (first seen first), or None
+    if the check did not print them all. 17M: riemannHypothesis. 300K: its five theorems."""
+    out = []
+    for t in ctx.p["theorems"]:
+        ax = parse_axioms(text, t)
+        if ax is None:
+            return None
+        out += [x for x in ax if x not in out]
+    return out
 
 
 # ---------------------------------------------------------------- processes
@@ -603,8 +713,166 @@ def mathlib_cache_present(folder: Path) -> bool:
     return (folder / ".lake/packages/mathlib/.lake/build/lib/lean/Mathlib.olean").exists()
 
 
+def others_text(data: dict, my_cpu: str = "") -> str:
+    """How long the build and the export took on other volunteers' computers, from the leaderboard's data.json:
+    one line per finished build, fastest first, so a newcomer can see where a computer like theirs lands. The
+    original proof (17M) first, then each other proof (from each row's `proofs`)."""
+    def h(x):
+        return f"{x:.0f} h" if x >= 10 else f"{x:.1f} h"
+    mine = " ".join(my_cpu.split()).lower()
+    def like(cpu):
+        return "  <- like this computer" if mine and cpu.lower() == mine else ""
+    out = []
+    rows = [r for r in data.get("leaderboard") or [] if r.get("whole_proof") and r.get("build_hours")]
+    if rows:
+        rows.sort(key=lambda r: r["build_hours"])
+        hours = [r["build_hours"] for r in rows]
+        exports = [r for r in rows if (r.get("export") or {}).get("done") and (r.get("export") or {}).get("matches")]
+        out += [f"How long it took others ({len(rows)} whole builds so far, from the leaderboard):",
+                f"  build:  {h(hours[0])} to {h(hours[-1])}; half finished within {h(hours[(len(hours) - 1) // 2])}"]
+        if exports:
+            ex = sorted(r["export"]["seconds"] / 3600 for r in exports)
+            out.append(f"  export: {h(ex[0])} to {h(ex[-1])} ({len(ex)} finished); it is slowest on computers with "
+                       "less than about 140 GB of memory")
+        out.append(f"  {'computer':<44} {'build':>6}  {'export':>6}")
+        for r in rows:
+            e = r.get("export") or {}
+            ex = h(e["seconds"] / 3600) if e.get("done") and e.get("matches") else "-"
+            cpu = " ".join(str(r.get("machine") or "?").split())
+            out.append(f"  {cpu[:44]:<44} {h(r['build_hours']):>6}  {ex:>6}{like(cpu)}")
+    for pk, P in PROOFS.items():
+        if pk == DEFAULT_PROOF:
+            continue
+        got = [((r.get("proofs") or {}).get(pk) or {}) for r in data.get("leaderboard") or []]
+        got = sorted((g for g in got if g.get("whole") and g.get("build_hours")), key=lambda g: g["build_hours"])
+        if not got:
+            continue
+        hours = [g["build_hours"] for g in got]
+        if out:
+            out.append("")
+        out += [f"The {P['label']} proof ({P['name']}): {len(got)} whole build{'s' if len(got) != 1 else ''} so far, "
+                f"{h(hours[0])} to {h(hours[-1])}; half finished within {h(hours[(len(hours) - 1) // 2])}",
+                f"  {'computer':<44} {'build':>6}"]
+        for g in got:
+            cpu = " ".join(str(g.get("machine") or "?").split())
+            out.append(f"  {cpu[:44]:<44} {h(g['build_hours']):>6}{like(cpu)}")
+    return "\n".join(out)
+
+
+def fetch_board():
+    """The live leaderboard's data.json, or None (optional: any failure, or RAH_NO_STATS, gives None)."""
+    if os.environ.get("RAH_NO_STATS"):
+        return None
+    try:
+        req = urllib.request.Request(SITE_URL + "data.json", headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read(5_000_000))
+    except Exception:
+        return None
+
+
+def show_others(ctx, data=None):
+    """Print others_text from the live leaderboard. Optional: any failure prints nothing."""
+    try:
+        data = data if data is not None else fetch_board()
+        text = others_text(data, machine().get("cpu", "")) if data else ""
+    except Exception:
+        return
+    if text:
+        print(text + "\n")
+
+
+# The question setup asks (owner's wording, 2026-11-25). 1 = the default, and what a run without a terminal gets.
+SETUP_QUESTION = """Which proof do you want to build?
+Both are Lean proofs of the Riemann Hypothesis using the same three axioms. Both put you on the leaderboard.
+
+  1) The new proof  [300K]  recommended
+     About 300,000 lines. 20 min to 2 h on most computers, 24 GB of memory.
+     The quickest way onto the leaderboard.
+  2) The original proof  [17M]  the big challenge
+     175,187 modules. Builds took 9 h to 64 h; the export wants about 140 GB of memory.
+     Counts most on the leaderboard.
+  3) Both  [17M] [300K]  ranks highest
+     The new proof first, then the original.
+"""
+SETUP_ANSWERS = {"1": ["300k"], "2": ["17m"], "3": ["300k", "17m"]}
+
+
+def legacy_17m(ctx) -> bool:
+    """Set up for 17M before setup asked which proof: keep it that way."""
+    return (ctx.base / "build_id").exists()        # every earlier setup made one (and only 17M existed)
+
+
+def ask_proof(ctx, data=None) -> list:
+    """Setup's question. In a terminal: 1, 2 or 3 (Enter = 1). Without one (an AI assistant, a script): 1."""
+    ctx._asked = True
+    print(SETUP_QUESTION)
+    show_others(ctx, data)
+    if not sys.stdin.isatty():
+        print("Not asked (no terminal): setting up the new proof (300K). For the original instead: "
+              "riemann-at-home setup --proof 17m; for both: riemann-at-home setup --proof both\n"
+              "(If an AI assistant is running this: tell the person these three choices and let them pick.)\n")
+        return SETUP_ANSWERS["1"]
+    while True:
+        try:
+            ans = input("Choose [1]: ").strip() or "1"
+        except EOFError:
+            ans = "1"
+        if ans in SETUP_ANSWERS:
+            return SETUP_ANSWERS[ans]
+        print("Please type 1, 2 or 3.")
+
+
+def setup_choice(ctx, a) -> list:
+    """Which proofs this setup sets up, in build order."""
+    want = getattr(a, "proof", None)
+    if want == "both":
+        return ["300k", "17m"]
+    if want in PROOFS:
+        return [want]
+    if getattr(a, "archive", None) or getattr(a, "parts_url", PART_URL) != PART_URL:
+        return [DEFAULT_PROOF]                        # given the 17M archive or its parts: that's the 17M proof
+    ch = ctx.conf().get("proofs") or {}
+    if ch.get("active") in PROOFS:                    # running setup again: the same proofs as last time
+        return [ch["active"]] + [x for x in ch.get("next") or [] if x in PROOFS]
+    if legacy_17m(ctx):
+        print("This computer is set up for the original proof (17M), so setup carries on with it. To build the new "
+              "proof (300K) too: riemann-at-home setup --proof 300k\n")
+        return [DEFAULT_PROOF]
+    return ask_proof(ctx, fetch_board())
+
+
 def cmd_setup(ctx: Ctx, a):
-    disk_heads_up(ctx)
+    order = setup_choice(ctx, a)
+    ch = ctx.conf().get("proofs") or {}
+    active = ch.get("active") if ch.get("active") in PROOFS else (DEFAULT_PROOF if legacy_17m(ctx) else None)
+    for k, pk in enumerate(order):
+        c = Ctx(a, proof=pk)
+        if getattr(a, "folder", None) and len(order) > 1:
+            c.folder = Path(a.folder) / PROOFS[pk]["folders"]["Linux"].rsplit("/", 1)[-1]   # testing: lean/, grh/
+        if order != [DEFAULT_PROOF]:                  # 17M alone: setup reads exactly as before
+            print(f"== {PROOFS[pk]['label']}: {PROOFS[pk]['name']}" + (f" ({k + 1} of {len(order)})" if len(order) > 1 else ""))
+        disk_heads_up(c)
+        if pk == DEFAULT_PROOF and len(order) == 1 and not getattr(ctx, "_asked", False):
+            show_others(c)
+        (setup_17m if pk == DEFAULT_PROOF else setup_git)(c, a)
+        print(f"this computer's build_id: {c.build_id()}" if order == [DEFAULT_PROOF]
+              else f"this computer's {PROOFS[pk]['label']} build_id: {c.build_id()}\n")
+    if active and active not in order:                # another proof is already set up here: it stays the default
+        print(f"Commands without --proof still mean {PROOFS[active]['label']} here; for this one add "
+              f"--proof {order[0]} (for example: riemann-at-home build --proof {order[0]}).")
+        ctx.set_conf(proofs={**ch, "active": active})
+        nxt = f"riemann-at-home build --proof {order[0]}"
+    else:
+        ctx.set_conf(proofs={"active": order[0], "next": order[1:]})
+        nxt = "riemann-at-home build"
+    ask_consent(Ctx(a, proof=order[0]))
+    print(f"ready. Next: {nxt}" + (f"   (when the {PROOFS[order[0]]['label']} build is done, the "
+                                   f"{PROOFS[order[1]]['label']} build starts by itself)" if len(order) > 1 else ""))
+
+
+def setup_17m(ctx: Ctx, a):
+    """The original proof: the official archive from alpo.ge, checked and unpacked; Lean 4.33.1; Mathlib cache."""
     folder = ctx.folder
     if folder.exists():
         tc = toolchain_of(folder)
@@ -627,24 +895,90 @@ def cmd_setup(ctx: Ctx, a):
         unpack(archive, folder)
         if toolchain_of(folder) != TOOLCHAIN:
             raise Fail(f"unpacked archive pins {toolchain_of(folder)}, expected {TOOLCHAIN}")
+    install_lean(ctx, a, "Mathlib")
+
+
+def install_lean(ctx: Ctx, a, cache_target):
+    """Steps 2 and 3 of every proof's setup: its pinned Lean through elan, then Mathlib's compiled cache."""
+    tc, folder = ctx.p["toolchain"], ctx.folder
     elan = ensure_elan()
-    if toolchain_installed(elan):
-        print(f"[2/3] Lean {TOOLCHAIN} already installed")
+    if toolchain_installed(elan, tc):
+        print(f"[2/3] Lean {tc} already installed")
     else:
-        print(f"[2/3] installing Lean {TOOLCHAIN}")
-        if run([elan, "toolchain", "install", TOOLCHAIN], env=lean_env()).returncode != 0:
+        print(f"[2/3] installing Lean {tc}")
+        if run([elan, "toolchain", "install", tc], env=lean_env()).returncode != 0:
             raise Fail("toolchain install failed")
+    cmd = [which("lake") or "lake", "exe", "cache", "get"] + ([cache_target] if cache_target else [])
+    shown = " ".join(["lake"] + cmd[1:])
     if mathlib_cache_present(folder) and not a.force_cache:
         print("[3/3] Mathlib compiled cache already here")
     elif a.skip_cache:
         print("[3/3] skipping Mathlib cache (--skip-cache)")
     else:
-        print("[3/3] fetching Mathlib's compiled cache (lake exe cache get Mathlib)")
-        if run([which("lake") or "lake", "exe", "cache", "get", "Mathlib"], cwd=folder, env=lean_env()).returncode != 0:
-            raise Fail("`lake exe cache get Mathlib` failed; run setup again to retry")
-    print(f"this computer's build_id: {ctx.build_id()}")
-    ask_consent(ctx)
-    print(f"ready. Next: riemann-at-home build")
+        print(f"[3/3] fetching Mathlib's compiled cache ({shown})")
+        if run(cmd, cwd=folder, env=lean_env()).returncode != 0:
+            raise Fail(f"`{shown}` failed; run setup again to retry")
+
+
+SOURCE_FILE = ".riemann-at-home-source.json"   # in a git-sourced build folder: the commit and tree it came from
+
+
+def source_problem(folder: Path, P: dict):
+    """Why `folder` is not the proof's pinned source (None if it is): the commit and tree setup checked, recorded in
+    SOURCE_FILE, plus the pinned toolchain and Mathlib."""
+    try:
+        src = json.loads((folder / SOURCE_FILE).read_text())
+    except (OSError, ValueError):
+        return f"{folder} was not set up by riemann-at-home (no {SOURCE_FILE}); move it aside and run setup again"
+    if src.get("commit") != P["source"] or src.get("tree") != P["tree"]:
+        return f"{folder} is from commit {src.get('commit')}, expected {P['source']}; move it aside and run setup again"
+    if toolchain_of(folder) != P["toolchain"]:
+        return f"{folder} pins {toolchain_of(folder) or 'no toolchain'}, expected {P['toolchain']}"
+    if mathlib_rev_of(folder) != P["mathlib_rev"]:
+        return f"{folder} pins Mathlib {mathlib_rev_of(folder)}, expected {P['mathlib_rev']}"
+    return None
+
+
+def setup_git(ctx: Ctx, a):
+    """A proof published as a git repository (300K): clone it, check out exactly the pinned commit, check HEAD and
+    the edition's tree, and move that folder (grh/) into the fixed build folder. Then its Lean and Mathlib cache."""
+    P, folder = ctx.p, ctx.folder
+    if folder.exists():
+        err = source_problem(folder, P)
+        if err:
+            raise Fail(err)
+        print(f"[1/3] proof folder already here at commit {P['source'][:12]}: {folder} (skipping the clone)")
+    else:
+        if not shutil.which("git"):
+            raise Fail("git is needed to get this proof (macOS: xcode-select --install; Linux: your package manager)")
+        url = getattr(a, "source_url", None) or P["repo"]
+        parent = folder.parent
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            raise Fail(f"cannot create {parent}. Run once:  sudo mkdir -p {parent} && sudo chown $USER {parent}")
+        staging = parent / f".cloning-{os.getpid()}"
+        shutil.rmtree(staging, ignore_errors=True)
+        print(f"[1/3] cloning {url} at commit {P['source']}")
+        try:
+            if run(["git", "clone", "-q", "--no-checkout", url, staging]).returncode != 0:
+                raise Fail(f"git clone {url} failed; run setup again to retry")
+            g = lambda *x: subprocess.run(["git", "-C", str(staging), *x], capture_output=True, text=True)
+            if g("-c", "advice.detachedHead=false", "checkout", "-q", "--detach", P["source"]).returncode != 0:
+                raise Fail(f"{url} has no commit {P['source']}")
+            head, tree = g("rev-parse", "HEAD").stdout.strip(), g("rev-parse", f"HEAD:{P['subdir']}").stdout.strip()
+            if head != P["source"] or tree != P["tree"] or g("status", "--porcelain").stdout.strip():
+                raise Fail(f"the checkout is not the pinned source (HEAD {head}, {P['subdir']}/ tree {tree}; "
+                           f"expected {P['source']}, {P['tree']})")
+            print(f"      HEAD {head} ok, {P['subdir']}/ tree {tree} ok; moving it to {folder}")
+            (staging / P["subdir"]).rename(folder)
+            (folder / SOURCE_FILE).write_text(json.dumps({"repo": url, "commit": head, "tree": tree}) + "\n")
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        err = source_problem(folder, P)
+        if err:
+            raise Fail(err)
+    install_lean(ctx, a, None)
 
 
 # ---------------------------------------------------------------- build control
@@ -718,8 +1052,8 @@ def check_update(ctx: "Ctx") -> dict:
             res["changes"] = [l for l in log.splitlines() if l][:20]
             res["available"] = bool(res["changes"])
     try:
-        ctx.home.mkdir(parents=True, exist_ok=True)
-        (ctx.home / "update.json").write_text(json.dumps(res, indent=1) + "\n")
+        ctx.base.mkdir(parents=True, exist_ok=True)
+        (ctx.base / "update.json").write_text(json.dumps(res, indent=1) + "\n")
     except OSError:
         pass
     return res
@@ -727,7 +1061,7 @@ def check_update(ctx: "Ctx") -> dict:
 
 def update_state(ctx: "Ctx") -> dict:
     try:
-        return json.loads((ctx.home / "update.json").read_text())
+        return json.loads((ctx.base / "update.json").read_text())
     except (OSError, ValueError):
         return {}
 
@@ -779,15 +1113,17 @@ def cmd_update(ctx: Ctx, a):
                        text=True)
     if m.returncode != 0:
         raise Fail("couldn't update (your copy has its own commits?): " + (m.stderr or m.stdout).strip()[:300])
-    (ctx.home / "update.json").write_text(json.dumps({"checked": iso(time.time()), "available": False,
+    (ctx.base / "update.json").write_text(json.dumps({"checked": iso(time.time()), "available": False,
                                                       "changes": []}) + "\n")
-    me = [sys.executable, "-I", str(Path(__file__).resolve())]
-    if supervisor(ctx):                           # restart the build with the new code; Lean picks up where it was
-        mode, paused = stored_mode(ctx), is_paused(ctx)
-        subprocess.run(me + ["stop", "--folder", str(ctx.folder)], check=False)
-        subprocess.run(me + ["build", f"--{mode}", "--folder", str(ctx.folder)], check=False)
-        if paused:
-            subprocess.run(me + ["pause", "--folder", str(ctx.folder)], check=False)
+    me = ctx.me()
+    for c in [ctx] + [Ctx(a, proof=pk) for pk in PROOFS if pk != ctx.proof and not getattr(a, "folder", None)]:
+        if supervisor(c):                         # restart each build with the new code; Lean picks up where it was
+            mode, paused = stored_mode(c), is_paused(c)
+            loc = ["--folder", str(c.folder)] + c.pargs()
+            subprocess.run(me + ["stop"] + loc, check=False, env=c.env())
+            subprocess.run(me + ["build", f"--{mode}"] + loc, check=False, env=c.env())
+            if paused:
+                subprocess.run(me + ["pause"] + loc, check=False, env=c.env())
     page = ctx.logs / "page.pid"                  # this computer's local page (written by `page`): restart it
     try:
         pid, port = (int(x) for x in page.read_text().split())
@@ -799,8 +1135,8 @@ def cmd_update(ctx: Ctx, a):
             if not pid_alive(pid):
                 break
             time.sleep(0.25)
-        subprocess.Popen(me + ["page", "--folder", str(ctx.folder), "--port", str(port)], stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.Popen(me + ["page", "--folder", str(ctx.folder), "--port", str(port)] + ctx.pargs(),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, env=ctx.env())
         print("local page restarted")
     print("updated")
     return 0
@@ -820,7 +1156,7 @@ def free_gb(folder: Path) -> float:
 
 def disk_message(ctx: Ctx) -> str:
     return (f"only {free_gb(ctx.folder):.1f} GB free on the build disk, so the build stopped to leave "
-            f"{MIN_FREE_GB:g} GB for the rest of your computer (a whole build needs about {WHOLE_BUILD_GB} GB). "
+            f"{MIN_FREE_GB:g} GB for the rest of your computer (a whole build needs about {ctx.p['whole_gb']} GB). "
             "Free some space, then `riemann-at-home build` continues from here. "
             "`record` and `submit` still work for what is built.")
 
@@ -831,9 +1167,10 @@ def disk_heads_up(ctx: Ctx) -> None:
     while not folder.exists() and folder != folder.parent:
         folder = folder.parent
     free = shutil.disk_usage(folder).free / 1e9
-    print(f"Heads up: building the whole proof takes about 2 days on a fast computer (a week or more on a laptop) and "
-          f"needs roughly {WHOLE_BUILD_GB} GB of free disk (estimated from builds so far). This computer has {free:.0f} GB free.")
-    if free < WHOLE_BUILD_GB:
+    gb = ctx.p["whole_gb"]
+    print(f"Heads up: building the whole {'' if ctx.proof == DEFAULT_PROOF else ctx.p['label'] + ' '}proof takes {ctx.p['takes']} and "
+          f"needs roughly {gb} GB of free disk (estimated from builds so far). This computer has {free:.0f} GB free.")
+    if free < gb:
         print(f"That's not enough for the whole proof, and that's fine: the build stops by itself when "
               f"{MIN_FREE_GB:g} GB are left, so your computer always keeps room, and every module you built still "
               "counts on the leaderboard.")
@@ -868,8 +1205,9 @@ def cmd_build(ctx: Ctx, a):
     if other:
         raise Fail(f"another build is already running in {ctx.folder} (lake pid {', '.join(map(str, other))}), "
                    "not started by this tool. Stop that one first.")
-    if toolchain_of(ctx.folder) != TOOLCHAIN:
-        raise Fail(f"{ctx.folder} is not set up (expected lean-toolchain {TOOLCHAIN}); run: riemann-at-home setup")
+    if toolchain_of(ctx.folder) != ctx.p["toolchain"]:
+        raise Fail(f"{ctx.folder} is not set up (expected lean-toolchain {ctx.p['toolchain']}); run: "
+                   f"riemann-at-home setup --proof {ctx.proof}")
     if not which("lake"):
         raise Fail("lake not found; run: riemann-at-home setup")
     if free_gb(ctx.folder) < MIN_FREE_GB:
@@ -878,20 +1216,67 @@ def cmd_build(ctx: Ctx, a):
     if a.submit_repo:                         # older, dry-run-only setting
         ctx.set_conf(repo=str(Path(a.submit_repo).expanduser().resolve()))
     ctx.mode_file.write_text(mode)
-    cmd = [sys.executable, "-I", str(Path(__file__).resolve()), "_run", "--folder", str(ctx.folder),
-           "--logs", str(ctx.logs), "--target", a.target] + (["--test-unofficial-folder"] if a.test_unofficial_folder else [])
+    target = build_target(ctx, a)
+    cmd = ctx.me() + ["_run", "--folder", str(ctx.folder), "--logs", str(ctx.logs)] + ctx.pargs() + \
+        (["--target", target] if target else []) + (["--test-unofficial-folder"] if a.test_unofficial_folder else [])
     with open(ctx.logs / "supervisor.log", "ab") as lf:
         p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, start_new_session=True,
-                             env={**os.environ, "RAH_HOME": str(ctx.home)})
+                             env=ctx.env())
     for _ in range(100):
         if read_pid(ctx.pgid_file) and supervisor(ctx) == p.pid:
             break
         if p.poll() is not None:
             raise Fail(f"build failed to start; see {ctx.logs / 'supervisor.log'}")
         time.sleep(0.1)
-    print(f"building `lake build {a.target}` in {ctx.folder} ({mode}), in the background.\n"
+    print(f"building {'' if ctx.proof == DEFAULT_PROOF else 'the ' + ctx.p['label'] + ' proof, '}"
+          f"`{' '.join(['lake', 'build'] + ([target] if target else []))}` in {ctx.folder} ({mode}), in the background.\n"
           f"  log: {ctx.logs / 'build.log'}\n  riemann-at-home status | pause | resume | stop")
     return 0
+
+
+def build_target(ctx: Ctx, a):
+    """What `lake build` builds: --target if given (testing), else the proof's own (17M: Main; 300K: the defaults)."""
+    return getattr(a, "target", None) or ctx.p["target"]
+
+
+def crashed_modules(log_tail: str) -> list:
+    """[(module, Lean's exit code)] for each module lake says Lean crashed on: a `✖ [i/n] Building X` line followed
+    (before the next module line) by `Lean exited with code N`. Lake itself then exits 1, so the code that says
+    what happened (139 = segfault) is only in build.log, as is the module."""
+    out, cur = [], None
+    for line in log_tail.splitlines():
+        m = re.match(r"\s*[✖✔⣿]\s*\[\d+/\d+\]\s+(?:Building|Built|Compiling)\s+(\S+)", line)
+        if m:
+            cur = m[1] if line.lstrip().startswith("✖") else None
+        elif cur and (m := re.search(r"exited with code (-?\d+)", line)):
+            if (cur, int(m[1])) not in out:
+                out.append((cur, int(m[1])))
+            cur = None
+    return out
+
+
+def crashes(ctx: Ctx) -> list:
+    """This build's Lean crashes, newest last: [{module, code, at}] (logs/crashes.json, kept per build_id)."""
+    try:
+        d = json.loads(read(ctx.logs / "crashes.json") or "{}")
+    except ValueError:
+        return []
+    return d.get("crashes", []) if d.get("build_id") == ctx.build_id() else []
+
+
+def note_crash(ctx: Ctx, rc: int, log_from: int) -> str:
+    """After lake build exits with rc != 0: find the crashed module(s) in the new part of build.log, keep them for
+    status and the build record. Returns the module names for the message."""
+    try:
+        with open(ctx.logs / "build.log", "rb") as f:
+            f.seek(max(log_from, f.seek(0, 2) - (4 << 20)))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        tail = ""
+    found = crashed_modules(tail) or [("unknown", rc)]
+    got = crashes(ctx) + [{"module": m, "code": c, "at": iso(time.time())} for m, c in found]
+    (ctx.logs / "crashes.json").write_text(json.dumps({"build_id": ctx.build_id(), "crashes": got[-CRASHES_MAX:]}) + "\n")
+    return ", ".join(f"{m} (Lean exit code {c})" for m, c in found)
 
 
 def cmd_run(ctx: Ctx, a):
@@ -907,19 +1292,26 @@ def cmd_run(ctx: Ctx, a):
         return 1
     mode = stored_mode(ctx)
     tcmd = (["/usr/bin/time", "-l"] if IS_MAC else ["/usr/bin/time", "-v"]) if Path("/usr/bin/time").exists() else []
-    cmd = tcmd + ["nice", "-n", "19", which("lake") or "lake", "--no-ansi", "build", a.target]
+    target = build_target(ctx, a)
+    cmd = tcmd + ["nice", "-n", "19", which("lake") or "lake", "--no-ansi", "build"] + ([target] if target else [])
     stopping, terminated, disk_low = threading.Event(), threading.Event(), threading.Event()
-    with open(ctx.logs / "build.log", "ab") as out, open(ctx.logs / "time.txt", "ab") as err:
-        p = subprocess.Popen(cmd, cwd=ctx.folder, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                             env=lean_env(), start_new_session=True)
-    ctx.pgid_file.write_text(str(p.pid))
-    start_caffeinate(ctx, p.pid)
+    cur = {}
+
+    def launch():
+        cur["log_from"] = (ctx.logs / "build.log").stat().st_size if (ctx.logs / "build.log").exists() else 0
+        with open(ctx.logs / "build.log", "ab") as out, open(ctx.logs / "time.txt", "ab") as err:
+            cur["p"] = subprocess.Popen(cmd, cwd=ctx.folder, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                        env=lean_env(), start_new_session=True)
+        ctx.pgid_file.write_text(str(cur["p"].pid))
+        start_caffeinate(ctx, cur["p"].pid)
+        return cur["p"]
+    p = launch()
 
     def on_term(sig, frm):
         terminated.set()
         for s in (signal.SIGCONT, signal.SIGTERM):
             try:
-                os.killpg(p.pid, s)
+                os.killpg(cur["p"].pid, s)
             except OSError:
                 pass
     signal.signal(signal.SIGTERM, on_term)
@@ -944,7 +1336,8 @@ def cmd_run(ctx: Ctx, a):
     threading.Thread(target=disk_guard, daemon=True).start()
     setup_sweeper(ctx, stopping)              # keeps a whole build near 160 GB instead of 1.2 TB
     update_checker(ctx, stopping)             # daily: is there a newer version? (tells, never installs)
-    setup_export_check(ctx, stopping)         # 5 min in: will the export step work on this computer? (issue #14)
+    if ctx.p["levels"]:
+        setup_export_check(ctx, stopping)     # 5 min in: will the export step work on this computer? (issue #14)
 
     (ctx.logs / "supervisor.features").write_text(f"{os.getpid()} autosubmit-v2\n")   # rereads interval/config
 
@@ -952,32 +1345,93 @@ def cmd_run(ctx: Ctx, a):
         while not stopping.wait(autosubmit_interval(ctx)):
             autosubmit(ctx, a, "progress")
     threading.Thread(target=progress, daemon=True).start()
-    if mode == "gentle":                      # new lean processes inherit lake's policy
-        for _ in range(30):
-            pids = build_pids(ctx)
-            if pids:
-                set_priority(pids, mode)
-                break
-            time.sleep(1)
-    rc = p.wait()
+    def gentle():
+        if stored_mode(ctx) == "gentle":          # new lean processes inherit lake's policy
+            for _ in range(30):
+                pids = build_pids(ctx)
+                if pids:
+                    set_priority(pids, stored_mode(ctx))
+                    break
+                if cur["p"].poll() is not None:   # already exited (a crash at start): nothing to set
+                    break
+                time.sleep(1)
+    gentle()
+    # A crash (Lean has segfaulted near the end of whole builds) used to end the build silently, leaving the
+    # leaderboard showing it as building. Restart it: lake keeps every finished module and redoes only the rest.
+    retries = 0
+    while True:
+        rc = p.wait()
+        if rc != 0 and not terminated.is_set() and not disk_low.is_set():
+            where = note_crash(ctx, rc, cur["log_from"])
+            with open(ctx.logs / "build.log", "a") as f:
+                f.write(f"\nriemann-at-home: lake build exited with {rc}; failed: {where}.\n")
+        if rc == 0 or terminated.is_set() or disk_low.is_set() or retries >= BUILD_RETRIES:
+            break
+        retries += 1
+        stop_caffeinate(ctx)
+        log_event(ctx, f"BUILD_CRASH={rc}")
+        with open(ctx.logs / "build.log", "a") as f:
+            f.write(f"\nriemann-at-home: lake build stopped with exit code {rc}; restarting it in "
+                    f"{BUILD_RETRY_WAIT:g} s (retry {retries} of {BUILD_RETRIES}). Finished modules are kept.\n")
+        if terminated.wait(BUILD_RETRY_WAIT):
+            break
+        p = launch()
+        gentle()
     stopping.set()
     stop_caffeinate(ctx)
     log_event(ctx, f"BUILD_EXIT={rc}")
-    final_submit = rc == 0 or disk_low.is_set()
-    if rc == 0 and a.target == "Main" and not terminated.is_set():
-        audit = ctx.home / "audit"
-        audit.mkdir(parents=True, exist_ok=True)
-        (audit / "Audit.lean").write_text(AUDIT_LEAN)
-        with open(ctx.logs / "axioms.log", "wb") as f:
-            r = subprocess.run([which("lake") or "lake", "--no-ansi", "env", "lean", f"--root={audit}",
-                                str(audit / "Audit.lean")], cwd=ctx.folder, stdout=f, stderr=subprocess.STDOUT,
-                               env=lean_env())
-        log_event(ctx, f"AXIOMS_EXIT={r.returncode}")
+    crashed = rc != 0 and not terminated.is_set() and not disk_low.is_set()
+    if crashed:
+        log_event(ctx, "BUILD_GAVE_UP")
+    final_submit = rc == 0 or disk_low.is_set() or crashed      # the board gets the last count either way
+    if rc == 0 and target == ctx.p["target"] and not terminated.is_set():
+        log_event(ctx, f"AXIOMS_EXIT={axiom_check(ctx)}")
     if final_submit:
         autosubmit(ctx, a, "final")
+    if rc == 0 and target == ctx.p["target"] and not terminated.is_set():
+        start_next_proof(ctx)
     ctx.pgid_file.unlink(missing_ok=True)
     ctx.pid_file.unlink(missing_ok=True)
     return rc
+
+
+def axiom_check(ctx: Ctx) -> int:
+    """After a whole build: which axioms the theorems use, into logs/axioms.log. 17M: our own copy of the check
+    (AUDIT_LEAN, with --root). Other proofs: their own script, which must say exactly AUDIT_LEAN. Returns the exit code."""
+    lake = which("lake") or "lake"
+    if ctx.p.get("audit"):
+        script = ctx.folder / ctx.p["audit"]
+        if read(script) != AUDIT_LEAN:
+            (ctx.logs / "axioms.log").write_text(f"riemann-at-home: {script} is not the expected axiom check\n")
+            return 1
+        cmd = [lake, "--no-ansi", "env", "lean", ctx.p["audit"]]
+    else:
+        audit = ctx.home / "audit"
+        audit.mkdir(parents=True, exist_ok=True)
+        (audit / "Audit.lean").write_text(AUDIT_LEAN)
+        cmd = [lake, "--no-ansi", "env", "lean", f"--root={audit}", str(audit / "Audit.lean")]
+    with open(ctx.logs / "axioms.log", "wb") as f:
+        return subprocess.run(cmd, cwd=ctx.folder, stdout=f, stderr=subprocess.STDOUT, env=lean_env()).returncode
+
+
+def start_next_proof(ctx: Ctx):
+    """Setup chose "both": when this proof is whole with the expected axioms, start the next one (same speed)."""
+    ch = ctx.conf().get("proofs") or {}
+    ax = proof_axioms(ctx, read(ctx.logs / "axioms.log"))
+    if ch.get("active") != ctx.proof or not ch.get("next") or ax is None or sorted(ax) != sorted(EXPECTED_AXIOMS):
+        return
+    nxt, rest = ch["next"][0], ch["next"][1:]
+    ctx.set_conf(proofs={"active": nxt, "next": rest})
+    nc = Ctx(argparse.Namespace(folder=None, logs=None), proof=nxt)
+    with open(ctx.logs / "build.log", "a") as f:
+        f.write(f"\nriemann-at-home: the {ctx.p['label']} proof is done; starting the {nc.p['label']} build "
+                "(you chose both at setup).\n")
+    if toolchain_of(nc.folder) != nc.p["toolchain"]:
+        with open(ctx.logs / "build.log", "a") as f:
+            f.write(f"riemann-at-home: {nc.folder} is not set up; run: riemann-at-home setup --proof {nxt}\n")
+        return
+    subprocess.Popen(ctx.me() + ["build", f"--{stored_mode(ctx)}"] + nc.pargs(), stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, env=ctx.env())
 
 
 def autosubmit(ctx: Ctx, a, why: str):
@@ -985,15 +1439,15 @@ def autosubmit(ctx: Ctx, a, why: str):
     disk, which rereads config.json each time. Output goes to logs/autosubmit.log. Never raises."""
     if AUTOSUBMIT == "off":
         return
-    me = [sys.executable, "-I", str(Path(__file__).resolve())]
-    loc = ["--folder", str(ctx.folder), "--logs", str(ctx.logs)]
+    me = ctx.me()
+    loc = ["--folder", str(ctx.folder), "--logs", str(ctx.logs)] + ctx.pargs()
     with open(ctx.logs / "autosubmit.log", "a") as f:
         f.write(f"--- autosubmit ({why}) {iso(time.time())}\n")
         f.flush()
         try:
             extra = ["--test-unofficial-folder"] if getattr(a, "test_unofficial_folder", False) else []
             subprocess.run(me + ["_autosubmit"] + loc + extra, stdout=f, stderr=subprocess.STDOUT,
-                           env={**os.environ, "RAH_HOME": str(ctx.home)}, timeout=6 * 3600)
+                           env=ctx.env(), timeout=6 * 3600)
         except Exception as e:
             f.write(f"autosubmit failed: {e}\n")
 
@@ -1092,12 +1546,33 @@ def built_by_this_tool(ctx: Ctx) -> int:
     return sum(max(0, g[-1][1] - g[0][1]) for g in session_samples(ctx))
 
 
+def status_proofs(ctx: Ctx, a) -> list:
+    """Which proofs `status` shows: the one asked for (--proof or --folder), else every proof set up on this
+    computer (its folder or its build_id exists), else the default one."""
+    if getattr(a, "proof", None) in PROOFS or getattr(a, "folder", None):
+        return [ctx]
+    out = [c for c in (Ctx(a, proof=pk) for pk in PROOFS) if c.folder.exists() or c.build_id_file.exists()]
+    return sorted(out, key=lambda c: c.proof != ctx.proof) or [ctx]
+
+
 def cmd_status(ctx: Ctx, a):
+    cs = status_proofs(ctx, a)
+    for k, c in enumerate(cs):
+        if len(cs) > 1:
+            print(("\n" if k else "") + f"proof     {c.p['label']}: {c.p['name']}" +
+                  (" (commands without --proof)" if c.proof == ctx.proof else f" (add --proof {c.proof})"))
+        status_one(c, a)
+    return 0
+
+
+def status_one(ctx: Ctx, a):
     done = count_compiled(ctx.lib) if ctx.lib.exists() else 0
+    n = ctx.p["n"]
     sup = supervisor(ctx)
     ev = events(ctx)
-    print(f"folder    {ctx.folder}{'' if ctx.folder.exists() else '  (not set up: riemann-at-home setup)'}")
-    print(f"compiled  {done:,} / {N_MODULES:,} modules ({100 * done / N_MODULES:.2f}%)")
+    hint = "riemann-at-home setup" + ("" if ctx.proof == DEFAULT_PROOF else f" --proof {ctx.proof}")
+    print(f"folder    {ctx.folder}{'' if ctx.folder.exists() else f'  (not set up: {hint})'}")
+    print(f"compiled  {done:,} / {n:,} modules ({100 * done / n:.2f}%)")
     if sup:
         state = "PAUSED" if is_paused(ctx) else f"running, {stored_mode(ctx)}"
         active = len(build_pids(ctx, ("lean",)))
@@ -1109,6 +1584,15 @@ def cmd_status(ctx: Ctx, a):
         last = next((raw for k, raw, _ in reversed(ev) if k == "BUILD_EXIT"), None)
         how = {"BUILD_EXIT=0": "finished"}.get(last, "stopped" + (f" ({last})" if last else ""))
         print(f"build     not running, {how}" if ev else "build     not started yet")
+        gave_up = next((k for k, _, _ in reversed(ev) if k in ("BUILD_GAVE_UP", "START", "RESTART")), None)
+        if gave_up == "BUILD_GAVE_UP":
+            print(f"          !! the build CRASHED and stopped after {BUILD_RETRIES} automatic restarts. Finished "
+                  f"modules are kept: run `riemann-at-home build` to continue, and see {ctx.logs / 'build.log'}")
+    cr = crashes(ctx)
+    if cr:
+        last = cr[-1]
+        print(f"crashes   {len(cr)}: Lean crashed on {last['module']} (exit code {last['code']}, {last['at']})"
+              + (f" and {len(cr) - 1} earlier" if len(cr) > 1 else "") + "; reported with your build record")
     started, busy = busy_seconds(ctx, bool(sup) or bool(outside_build(ctx)))
     if started:
         print(f"started   {iso(started)}, busy {busy / 3600:.1f} h")
@@ -1119,8 +1603,9 @@ def cmd_status(ctx: Ctx, a):
     elif sup and r is None:
         print(f"speed     measuring (first reading about {SAMPLE_SECONDS / 60:.0f} min after the build started)")
     elif sup and r is not None:
-        left = N_MODULES - done
-        eta = f", about {left / r / 24:.1f} days to go at this speed" if r > 0 else ""
+        left = n - done
+        eta = "" if r <= 0 else f", about {left / r / 24:.1f} days to go at this speed" \
+            if ctx.proof == DEFAULT_PROOF or left / r >= 48 else f", about {fmt_dur(left / r * 3600)} to go at this speed"
         print(f"speed     {r:,.0f} modules/hour over the last {SPEED_WINDOW // 60} min{eta}")
     elif built and busy >= 600:
         print(f"speed     {built / busy * 3600:,.0f} modules/hour on average ({built:,} built while measured)")
@@ -1141,7 +1626,14 @@ def cmd_status(ctx: Ctx, a):
         print(f"update    available ({len(up['changes'])} change(s)): riemann-at-home update")
     ax = read(ctx.logs / "axioms.log")
     if ax:
-        print(f"axioms    {parse_axioms(ax)}")
+        print(f"axioms    {proof_axioms(ctx, ax)}" + (f" ({len(ctx.p['theorems'])} theorems)" if len(ctx.p['theorems']) > 1 else ""))
+    if not ctx.p["levels"]:
+        pa = proof_axioms(ctx, ax) if ax else None
+        if done == n and pa is not None:
+            print(f"level     whole {ctx.p['label']} proof built" + (", only the three standard axioms: this proof is "
+                  "finished (it has no export step yet)" if sorted(pa) == sorted(EXPECTED_AXIOMS) else
+                  f", but the axioms are not the expected {EXPECTED_AXIOMS}"))
+        return 0
     ex = levels_state(ctx).get("export")
     if ex and ex.get("sha256") == EXPORT_SHA256:
         lv = levels_state(ctx)
@@ -1150,7 +1642,7 @@ def cmd_status(ctx: Ctx, a):
               + (", joint statement signed" if lv.get("sign_statement") else ""))
     elif ex:
         print(f"export    sha256 {ex.get('sha256')} does not match the reference ({UNVERIFIED})")
-    elif done == N_MODULES and parse_axioms(ax) is not None:
+    elif done == n and parse_axioms(ax) is not None:
         print("level     1: whole proof built. Next: riemann-at-home export")
     if sign_when_done(ctx) and not levels_state(ctx).get("sign_statement"):
         print("statement signed in advance: takes effect when your export matches (undo: riemann-at-home sign --cancel)")
@@ -1160,17 +1652,25 @@ def cmd_status(ctx: Ctx, a):
 # ---------------------------------------------------------------- record
 
 def make_record(ctx: Ctx, a, final: bool = False) -> dict:
-    folder = ctx.folder
-    official = str(folder) == str(fixed_folder())
+    folder, P = ctx.folder, ctx.p
+    official = str(folder) == str(fixed_folder(ctx.proof))
     if not official and not a.test_unofficial_folder:
-        raise Fail(f"records come from the fixed folder {fixed_folder()} only (got {folder})")
-    if toolchain_of(folder) != TOOLCHAIN:
-        raise Fail(f"{folder} pins {toolchain_of(folder) or 'no toolchain'}, expected {TOOLCHAIN}")
-    if mathlib_rev_of(folder) != MATHLIB_REV:
-        raise Fail(f"{folder} pins Mathlib {mathlib_rev_of(folder)}, expected {MATHLIB_REV}")
+        raise Fail(f"records come from the fixed folder {fixed_folder(ctx.proof)} only (got {folder})")
+    if toolchain_of(folder) != P["toolchain"]:
+        raise Fail(f"{folder} pins {toolchain_of(folder) or 'no toolchain'}, expected {P['toolchain']}")
+    if mathlib_rev_of(folder) != P["mathlib_rev"]:
+        raise Fail(f"{folder} pins Mathlib {mathlib_rev_of(folder)}, expected {P['mathlib_rev']}")
+    if P.get("tree") and not a.test_unofficial_folder:          # a git-sourced proof: the commit setup checked
+        err = source_problem(folder, P)
+        if err:
+            raise Fail(err)
     mods = all_modules(folder)
-    if len(mods) != N_MODULES and not a.test_unofficial_folder:
-        raise Fail(f"{folder}/src has {len(mods):,} modules, expected {N_MODULES:,}: not the official archive")
+    if len(mods) != P["n"] and not a.test_unofficial_folder:
+        raise Fail(f"{folder}/src has {len(mods):,} modules, expected {P['n']:,}: not the official "
+                   + ("archive" if ctx.proof == DEFAULT_PROOF else "source"))
+    if P.get("tree") and not a.test_unofficial_folder:
+        if hashlib.sha256(("\n".join(mods) + "\n").encode()).hexdigest() != P["modules_sha256"]:
+            raise Fail(f"{folder}/src does not have the {P['label']} proof's module list: not the official source")
     done = compiled_modules(ctx.lib)
     bits = [m in done for m in mods]
     cache = HashCache(ctx.home / "olean-hashes.json")
@@ -1195,13 +1695,14 @@ def make_record(ctx: Ctx, a, final: bool = False) -> dict:
     busy = max(0, min(busy, recorded - started))
     axioms = None
     if n == len(mods) and mods:
-        axioms = parse_axioms(read(ctx.logs / "axioms.log"))
+        axioms = proof_axioms(ctx, read(ctx.logs / "axioms.log"))
     rec = {
         "format": FORMAT,
         "tool": TOOL,
-        "archive_sha256": ARCHIVE_SHA256,
-        "toolchain": TOOLCHAIN,
-        "mathlib_rev": MATHLIB_REV,
+        **({} if ctx.proof == DEFAULT_PROOF else {"proof": ctx.proof}),   # absent = 17M (CONTRACT "Several proofs")
+        P["source_field"]: P["source"],
+        "toolchain": P["toolchain"],
+        "mathlib_rev": P["mathlib_rev"],
         "build_folder": str(folder) if official else "unofficial",
         "build_id": bid,
         "machine": machine(),
@@ -1215,11 +1716,13 @@ def make_record(ctx: Ctx, a, final: bool = False) -> dict:
         "axioms": axioms,
         "final": bool(final),
     }
-    assert list(rec) == RECORD_KEYS
+    assert list(rec) == record_keys(ctx.proof)
     shown = ctx.conf().get("display")
     if isinstance(shown, dict) and name_problem(shown.get("display_name")) is None:
         rec["display_name"] = shown["display_name"]
     rec.update(level_fields(ctx, rec))
+    if crashes(ctx):
+        rec["crashes"] = crashes(ctx)
     if official:
         errs = validate_record(rec)
         if errs:
@@ -1228,6 +1731,15 @@ def make_record(ctx: Ctx, a, final: bool = False) -> dict:
 
 
 KEEP_RECORDS = 50
+
+
+def record_keys(proof: str) -> list:
+    """The required keys of a record of this proof, in order: 17M's are RECORD_KEYS; another proof says so with
+    "proof" and names its source with its own field (300K: source_commit) where 17M has archive_sha256."""
+    if proof == DEFAULT_PROOF:
+        return RECORD_KEYS
+    i = RECORD_KEYS.index("archive_sha256")
+    return RECORD_KEYS[:i] + ["proof", PROOFS[proof]["source_field"]] + RECORD_KEYS[i + 1:]
 
 
 def write_record(ctx: Ctx, rec: dict) -> Path:
@@ -1243,7 +1755,7 @@ def write_record(ctx: Ctx, rec: dict) -> Path:
 def cmd_record(ctx: Ctx, a):
     rec = make_record(ctx, a)
     out = write_record(ctx, rec)
-    print(f"{rec['modules_compiled']:,} / {N_MODULES:,} modules, busy {rec['busy_seconds'] / 3600:.1f} h"
+    print(f"{rec['modules_compiled']:,} / {ctx.p['n']:,} {'' if ctx.proof == DEFAULT_PROOF else ctx.p['label'] + ' '}modules, busy {rec['busy_seconds'] / 3600:.1f} h"
           f"{', WHOLE PROOF' if rec['whole_proof'] else ''}\n{out}")
     if called_by_supervisor(ctx) and (ctx.conf().get("submit") or {}).get("auto"):
         cmd_autosubmit(ctx, a)                    # a supervisor started before `_autosubmit` existed
@@ -1251,18 +1763,51 @@ def cmd_record(ctx: Ctx, a):
     return 0
 
 
+def finish_problem(ctx: Ctx):
+    """Why `finish` now would lose something for good, or None. A final record closes the build: nothing sent after
+    it is accepted (2026-11-25 review: a `finish` during the axiom check sent "not whole" as final; a `finish`
+    before or during the export threw the export result away)."""
+    pf = ctx.home / "export-progress.json"
+    try:
+        ep = json.loads(pf.read_text()) if pf.exists() else {}
+    except ValueError:
+        ep = {}
+    if ep and not ep.get("done") and time.time() - ep.get("updated", 0) < 15 * 60:
+        return "an export is running; finishing now would throw its result away. Let it finish first."
+    mods, done = all_modules(ctx.folder), compiled_modules(ctx.lib)
+    if not mods or any(m not in done for m in mods):
+        return None                                   # a partial build: finishing it is a normal choice
+    if proof_axioms(ctx, read(ctx.logs / "axioms.log")) is None:
+        return ("every module is built but the axiom check has not finished (it runs right after the last module, "
+                "a few minutes). Finishing now would send a final record that says the proof is not whole. "
+                "Wait until `riemann-at-home status` shows the axioms.")
+    if ctx.p["levels"] and not (ctx.conf().get("levels") or {}).get("export"):
+        return ("your whole build has not been exported yet. `finish` closes this build for good, so an export "
+                "result (Level 2) could never be added. Run `riemann-at-home export` first.")
+    return None
+
+
 def cmd_finish(ctx: Ctx, a):
     """Done with this computer: stop the build if it runs, write a final record, submit it (the bot then merges)."""
+    problem = finish_problem(ctx)
+    if a.dry_run:                                 # really nothing: no stop, no record (it used to write a final one)
+        print("would " + ("stop the build, then " if supervisor(ctx) else "") +
+              "write a final record and submit it; after that this build takes no more updates")
+        if problem:
+            print(f"but not now: {problem}")
+        return 0
+    if problem and not a.force:
+        raise Fail(f"{problem}\nTo finish anyway: riemann-at-home finish --force")
     if supervisor(ctx):
         print("stopping the build first")
         cmd_stop(ctx, a)
     rec = make_record(ctx, a, final=True)
     out = write_record(ctx, rec)
-    print(f"final record: {rec['modules_compiled']:,} / {N_MODULES:,} modules\n{out}")
+    print(f"final record: {rec['modules_compiled']:,} / {ctx.p['n']:,} {'' if ctx.proof == DEFAULT_PROOF else ctx.p['label'] + ' '}modules\n{out}")
     if not (a.submit or a.dry_run or (ctx.conf().get("submit") or {}).get("auto")):
         print("submit it with: riemann-at-home submit")
         return 0
-    a.record, a.enable_auto, a.disable_auto, a.interval = str(out), False, False, None
+    a.record, a.enable_auto, a.disable_auto, a.interval, a.dry_run = str(out), False, False, None, False
     return cmd_submit(ctx, a)
 
 
@@ -1270,21 +1815,32 @@ def cmd_finish(ctx: Ctx, a):
 
 def validate_record(rec: dict):
     errs = []
-    extra = [k for k in rec if k not in RECORD_KEYS]           # a set of keys: order does not matter
-    if (not set(RECORD_KEYS) <= set(rec) or any(k not in OPTIONAL_KEYS for k in extra)
+    pk = rec.get("proof", DEFAULT_PROOF)
+    if pk not in PROOFS or "proof" in rec and pk == DEFAULT_PROOF:   # 17M records never say "proof"
+        return [f"proof {pk!r} is not one of {[k for k in PROOFS if k != DEFAULT_PROOF]} (17M records leave it out)"]
+    P, keys = PROOFS[pk], record_keys(pk)
+    optional = OPTIONAL_KEYS if P["levels"] else [k for k in OPTIONAL_KEYS if k not in LEVEL_KEYS + PROGRESS_KEYS]
+    extra = [k for k in rec if k not in keys]                  # a set of keys: order does not matter
+    if (not set(keys) <= set(rec) or any(k not in optional for k in extra)
             or sum(k in rec for k in NAME_KEYS) > 1):
-        errs.append(f"keys {sorted(rec)} != {RECORD_KEYS} (+ optional {LEVEL_KEYS + PROGRESS_KEYS}, at most one of {NAME_KEYS})")
+        errs.append(f"keys {sorted(rec)} != {keys} (+ optional {[k for k in optional if k not in NAME_KEYS]}, at most one of {NAME_KEYS})")
+    cr = rec.get("crashes")
+    if cr is not None and not (isinstance(cr, list) and len(cr) <= CRASHES_MAX and all(
+            isinstance(c, dict) and set(c) == {"module", "code", "at"} and isinstance(c["module"], str)
+            and re.fullmatch(r"[^\s\x00-\x1f]{1,200}", c["module"]) and type(c["code"]) is int
+            and parse_time(str(c["at"])) is not None for c in cr)):
+        errs.append(f"crashes must be at most {CRASHES_MAX} {{module, code, at}} entries")
     if "display_name" in rec and name_problem(rec["display_name"]):
         errs.append(f"display_name: {name_problem(rec['display_name'])}")
     if "anonymous" in rec:
         errs.append("anonymous is not offered: the pull request always shows your GitHub username")
-    for k, v in (("format", FORMAT), ("archive_sha256", ARCHIVE_SHA256), ("toolchain", TOOLCHAIN),
-                 ("mathlib_rev", MATHLIB_REV)):
+    for k, v in (("format", FORMAT), (P["source_field"], P["source"]), ("toolchain", P["toolchain"]),
+                 ("mathlib_rev", P["mathlib_rev"])):
         if rec.get(k) != v:
             errs.append(f"{k} is {rec.get(k)!r}, expected {v!r}")
     if not re.fullmatch(r"[0-9a-f]{16}", str(rec.get("build_id"))):
         errs.append("build_id must be 16 lowercase hex chars")
-    if rec.get("build_folder") not in FIXED_FOLDERS.values():
+    if rec.get("build_folder") not in P["folders"].values():
         errs.append(f"build_folder {rec.get('build_folder')!r} is not a fixed folder")
     if rec.get("tool") != TOOL:
         errs.append(f"tool is {rec.get('tool')!r}, expected {TOOL!r}")
@@ -1302,9 +1858,10 @@ def validate_record(rec: dict):
     if len(json.dumps(rec, indent=2)) > 256 * 1024:
         errs.append("record over 256 KB")
     try:
-        bits = decode_bitmap(rec["bitmap_b64"], N_MODULES)   # exact length: no bits past module N-1
+        n = P["n"]
+        bits = decode_bitmap(rec["bitmap_b64"], n)           # exact length: no bits past module N-1
         raw = gzip.decompress(base64.b64decode(rec["bitmap_b64"]))
-        if N_MODULES % 8 and raw[-1] >> (N_MODULES % 8):
+        if n % 8 and raw[-1] >> (n % 8):
             errs.append("bitmap has bits past module N-1")
         if sum(bits) != rec.get("modules_compiled"):
             errs.append("modules_compiled != popcount(bitmap)")
@@ -1376,11 +1933,35 @@ def name_problem(name):
     return None
 
 
+def send_now(ctx: Ctx, a, why: str):
+    """After a change the leaderboard should see (sign, sign --cancel, recheck, name): send it to this build's PR now.
+    While a build runs its timer does that; after the build ends nothing else would (2026-11-25 review)."""
+    try:
+        bid = ctx.build_id()
+    except Exception:
+        return
+    st = ctx.conf().get("pr") or {}
+    if st.get("build_id") == bid and st.get("final_sent"):
+        print("This build's final record was already sent, so the leaderboard can't take this change any more. "
+              "To change what it shows, open an issue: https://github.com/Riemann-at-home/riemann-at-home/issues")
+        return
+    if supervisor(ctx):
+        print("the running build's next update sends it (within about 15 minutes)")
+        return
+    if AUTOSUBMIT != "off" and (ctx.conf().get("submit") or {}).get("auto"):
+        print("sending it to your pull request now...")
+        autosubmit(ctx, a, why)
+        print(f"done; details in {ctx.logs / 'autosubmit.log'}")
+    else:
+        print("send it with: riemann-at-home submit")
+
+
 def cmd_name(ctx: Ctx, a):
     """What the Riemann@home page shows for you instead of your GitHub login."""
     if a.clear:
         ctx.set_conf(display=None)
         print("cleared: the Riemann@home page shows your GitHub username")
+        send_now(ctx, a, "name")
         return 0
     if a.display_name is None:
         d = ctx.conf().get("display")
@@ -1394,6 +1975,7 @@ def cmd_name(ctx: Ctx, a):
     ctx.set_conf(display={"display_name": name})
     print(f"display name: {name}")
     print(NAME_NOTICE)
+    send_now(ctx, a, "name")
     return 0
 
 
@@ -1473,7 +2055,7 @@ def comparable(rec: dict) -> dict:
 def submit_real(ctx: Ctx, a, src: Path, rec: dict, login: str, upstream: str) -> int:
     """This build's one PR: branch rah/<build_id> = upstream main + one commit that writes
     submissions/<login>/<build_id>.json, force-pushed on every update. Opens the PR the first time."""
-    repo = ctx.home / "repo"                     # the tool's own clone; never the volunteer's checkouts
+    repo = ctx.base / "repo"                     # the tool's own clone (one for all proofs); never the volunteer's checkouts
     bid = rec["build_id"]
     rel = f"submissions/{login}/{bid}.json"
     branch = f"rah/{bid}"
@@ -1526,11 +2108,12 @@ def submit_real(ctx: Ctx, a, src: Path, rec: dict, login: str, upstream: str) ->
             raise Fail(WORKFLOW_SCOPE_FIX) from None
         raise
     if pr["state"] != "open":
-        title = f"Riemann@home build {bid} ({login})"
+        lab = PROOFS[rec.get("proof", DEFAULT_PROOF)]["label"]
+        title = f"Riemann@home build {bid} ({login})" if lab == "17M" else f"Riemann@home {lab} build {bid} ({login})"
         m = rec["machine"]
-        body = (f"Riemann@home build record for one computer (build `{bid}`). The tool updates this pull request "
-                f"while the build runs; the bot checks each version.\n\n"
-                f"- modules compiled: {rec['modules_compiled']:,} / {N_MODULES:,}\n"
+        body = (f"Riemann@home build record for one computer (build `{bid}`, the {lab} proof). The tool updates this "
+                f"pull request while the build runs; the bot checks each version.\n\n"
+                f"- modules compiled: {rec['modules_compiled']:,} / {PROOFS[rec.get('proof', DEFAULT_PROOF)]['n']:,}\n"
                 f"- machine: {m.get('cpu')}, {m.get('cores')} cores, {m.get('os')} ({m.get('arch')})\n")
         url = gh(["pr", "create", "--repo", upstream, "--head", f"{owner}:{branch}", "--base", "main",
                   "--title", title, "--body", body], "open the pull request").strip().splitlines()[-1]
@@ -1590,8 +2173,8 @@ def latest_record(ctx: Ctx) -> Path:
 def submit_lock(ctx: Ctx):
     """One submit at a time (the build's auto-submit and a manual one could overlap)."""
     import fcntl
-    ctx.home.mkdir(parents=True, exist_ok=True)
-    f = open(ctx.home / "submit.lock", "w")
+    ctx.base.mkdir(parents=True, exist_ok=True)
+    f = open(ctx.base / "submit.lock", "w")                 # all proofs share the clone: one submit at a time
     fcntl.flock(f, fcntl.LOCK_EX)
     return f
 
@@ -1632,7 +2215,41 @@ def ask_consent(ctx: Ctx):
         return
     name = input("Name on the leaderboard (Enter = your GitHub username, or type a display name): ").strip()
     agree(ctx, name or None)
-    ask_sign_when_done(ctx)
+    if ctx.p["levels"]:                           # the joint statement is about the 17M proof
+        ask_sign_when_done(ctx)
+    share_nudge(ctx, "joined")
+
+
+SHARE_TEXT = {
+    "joined": "I'm running a validator for the Riemann Hypothesis Lean proof in my spare CPU cycles. Join in:",
+    "signed": "My computer built the whole Riemann Hypothesis Lean proof, reproduced the reference export, and I "
+              "signed the joint statement. Run a validator too:",
+}
+
+
+def my_link(ctx: Ctx) -> str:
+    """Their personal leaderboard link: the site opened on their row. Keyed by the name the leaderboard shows
+    (the display name they chose, else the GitHub login), so a chosen display name never exposes the login."""
+    from urllib.parse import quote
+    c = ctx.conf()
+    name = ((c.get("display") or {}).get("display_name") or (c.get("consent") or {}).get("login") or "").strip()
+    return f"{SITE_URL}#@{quote(name, safe='-')}" if name else SITE_URL
+
+
+def share_nudge(ctx: Ctx, kind: str):
+    """After setup's yes and after signing (owner, 2026-11-23): invite the person to post about it, with their
+    personal link back to the site so others join. Only prints links; nothing is posted for them."""
+    from urllib.parse import quote
+    text, url = SHARE_TEXT[kind], my_link(ctx)
+    full = f"{text} {url}"
+    print(("\nYou're validating!" if kind == "joined" else "\nYou're a validator!") +
+          " Tell people, so more computers join in:\n"
+          f"  \"{full}\"\n"
+          f"  X:        https://x.com/intent/tweet?text={quote(text)}&url={quote(url, safe='')}\n"
+          f"  Bluesky:  https://bsky.app/intent/compose?text={quote(full)}\n"
+          f"  LinkedIn: https://www.linkedin.com/sharing/share-offsite/?url={quote(url, safe='')}")
+    if not sys.stdin.isatty():
+        print("(If an AI assistant is running this: pass these links on to the person; don't post for them.)")
 
 
 def ask_sign_when_done(ctx: Ctx):
@@ -1691,9 +2308,12 @@ def agree(ctx: Ctx, name=None, upstream=None):
 
 
 def cmd_submit(ctx: Ctx, a):
+    # every proof submits the same way (one PR per build); a 300K record says "proof": "300k" (CONTRACT "Several proofs")
     if getattr(a, "agree", False):
         agree(ctx, a.name, a.upstream)
-        ask_sign_when_done(ctx)                     # the optional second question, as at setup
+        if ctx.p["levels"]:
+            ask_sign_when_done(ctx)                 # the optional second question, as at setup (17M only)
+        share_nudge(ctx, "joined")
         return 0
     if a.interval is not None:
         if a.interval < MIN_INTERVAL:
@@ -1719,7 +2339,7 @@ def cmd_submit(ctx: Ctx, a):
             print("auto-submit off")
         return 0
     if a.repo and not a.dry_run:
-        raise Fail(f"--repo is only for --dry-run; real submits use the tool's own clone at {ctx.home / 'repo'}")
+        raise Fail(f"--repo is only for --dry-run; real submits use the tool's own clone at {ctx.base / 'repo'}")
     src = Path(a.record) if a.record else latest_record(ctx)
     rec = json.loads(src.read_text())
     errs = validate_record(rec)
@@ -1730,7 +2350,7 @@ def cmd_submit(ctx: Ctx, a):
     login = a.login or gh_login()
     if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", login):
         raise Fail(f"{login!r} does not look like a GitHub login")
-    repo = Path(a.repo).expanduser().resolve() if a.repo else ctx.home / "repo"
+    repo = Path(a.repo).expanduser().resolve() if a.repo else ctx.base / "repo"
     upstream = a.upstream or (ctx.conf().get("submit") or {}).get("upstream")
     if not upstream and a.repo:
         url = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"], capture_output=True,
@@ -1759,8 +2379,10 @@ def cmd_submit(ctx: Ctx, a):
     if pr["state"] == "open":
         head = "update the open PR (quiet: no new PR)"
     else:
+        lab = PROOFS[rec.get("proof", DEFAULT_PROOF)]["label"]
         plan.append(["gh", "pr", "create", "--repo", upstream, "--head", f"<{upstream.split('/')[0]} or {login}>:{branch}",
-                     "--base", "main", "--title", f"Riemann@home build {bid} ({login})", "--body", "..."])
+                     "--base", "main", "--title", f"Riemann@home {'' if lab == '17M' else lab + ' '}build {bid} ({login})",
+                     "--body", "..."])
         head = "open this build's one PR"
     print(f"DRY RUN: nothing is written, committed, pushed or opened.\nrecord: {src}\nas:     {rel} on branch {branch}\n"
           f"step:   {head} -> {upstream}\nwould run:")
@@ -1793,17 +2415,16 @@ def ensure_companion(ctx: Ctx):
     if not sup or (pid and pid_alive(pid, "_autosubmit_loop")):
         return
     with open(ctx.logs / "autosubmit.log", "ab") as lf:
-        p = subprocess.Popen([sys.executable, "-I", str(Path(__file__).resolve()), "_autosubmit_loop", "--folder",
-                              str(ctx.folder), "--logs", str(ctx.logs)], stdin=subprocess.DEVNULL, stdout=lf,
-                             stderr=lf, start_new_session=True, env={**os.environ, "RAH_HOME": str(ctx.home)})
+        p = subprocess.Popen(ctx.me() + ["_autosubmit_loop", "--folder", str(ctx.folder), "--logs", str(ctx.logs)]
+                             + ctx.pargs(), stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, start_new_session=True,
+                             env=ctx.env())
     pidf.write_text(str(p.pid))
 
 
 def cmd_autosubmit_loop(ctx: Ctx, a):
     """The companion loop (see ensure_companion). Ends when the build stops or auto-submit is turned off."""
     sup = old_supervisor(ctx)
-    me = [sys.executable, "-I", str(Path(__file__).resolve()), "_autosubmit", "--folder", str(ctx.folder),
-          "--logs", str(ctx.logs)]
+    me = ctx.me() + ["_autosubmit", "--folder", str(ctx.folder), "--logs", str(ctx.logs)] + ctx.pargs()
     while sup and supervisor(ctx) == sup and (ctx.conf().get("submit") or {}).get("auto"):
         time.sleep(autosubmit_interval(ctx))
         if supervisor(ctx) != sup or not (ctx.conf().get("submit") or {}).get("auto"):
@@ -1812,8 +2433,7 @@ def cmd_autosubmit_loop(ctx: Ctx, a):
             f.write(f"--- autosubmit (progress, every {autosubmit_interval(ctx):g} s) {iso(time.time())}\n")
             f.flush()
             try:
-                subprocess.run(me, stdout=f, stderr=subprocess.STDOUT, env={**os.environ, "RAH_HOME": str(ctx.home)},
-                               timeout=6 * 3600)
+                subprocess.run(me, stdout=f, stderr=subprocess.STDOUT, env=ctx.env(), timeout=6 * 3600)
             except Exception as e:
                 f.write(f"autosubmit failed: {e}\n")
     (ctx.logs / "autosubmit-loop.pid").unlink(missing_ok=True)
@@ -1827,7 +2447,7 @@ def cmd_autosubmit(ctx: Ctx, a):
         if a.cmd != "record":                     # (an older supervisor calls `record`, which already wrote one)
             rec = make_record(ctx, a)
             out = write_record(ctx, rec)
-            print(f"{rec['modules_compiled']:,} / {N_MODULES:,} modules\n{out}")
+            print(f"{rec['modules_compiled']:,} / {ctx.p['n']:,} {'' if ctx.proof == DEFAULT_PROOF else ctx.p['label'] + ' '}modules\n{out}")
         sc = ctx.conf().get("submit") or {}
         if sc.get("auto"):
             ns = argparse.Namespace(enable_auto=False, disable_auto=False, interval=None, repo=None, record=None, login=None,
@@ -1886,7 +2506,7 @@ def levels_state(ctx: Ctx, digest: str = None) -> dict:
 def level_fields(ctx: Ctx, rec: dict) -> dict:
     """The optional record fields earned so far. Only a reproduced export goes into a record (the bot rejects any
     other export hash); checkers and the signature only on top of that."""
-    if not rec.get("whole_proof"):
+    if not rec.get("whole_proof") or not ctx.p["levels"]:
         return {}
     out = {}
     ep = export_progress(ctx, rec["olean_digest"])
@@ -1908,12 +2528,77 @@ def whole_build(ctx: Ctx, a, what: str) -> dict:
     """A record of the build, which must be whole with the axiom check passed."""
     rec = make_record(ctx, a)
     if not rec["whole_proof"]:
-        raise Fail(f"{what} needs the whole build first: {rec['modules_compiled']:,} / {N_MODULES:,} modules compiled "
+        raise Fail(f"{what} needs the whole build first: {rec['modules_compiled']:,} / {ctx.p['n']:,} modules compiled "
                    "and the axiom check run (`riemann-at-home build` runs it when the build finishes)")
     if sorted(rec["axioms"]) != sorted(EXPECTED_AXIOMS):
         raise Fail(f"{what} needs a passing axiom check; riemannHypothesis depends on {rec['axioms']}, "
                    f"expected {EXPECTED_AXIOMS}")
     return rec
+
+
+FAST_EXIT_LOOP = ("    for c in constants do\n      modify (fun st => { st with noMDataExprs := {} })\n"
+                  "      dumpConstant c\n")
+FAST_EXIT_ADD = "    (← IO.getStdout).flush\n    IO.Process.exit 0\n"
+
+
+def patch_fast_exit(main_lean: str):
+    """lean4export's Main.lean with Derek Blanchette's fix (issue #24), or None if the file is not the one it fits.
+    After the last constant the exporter used to free its whole cache one object at a time before exiting; on a
+    computer that is swapping that took hours at "99%" with all the data already written. The fix flushes the
+    output and exits, and the operating system frees the memory at once. The output is unchanged; the export's own
+    comparison with the reference hash checks that on every run."""
+    body = main_lean.rstrip("\n") + "\n"
+    if not body.endswith(FAST_EXIT_LOOP) or body.count(FAST_EXIT_LOOP) != 1:
+        return None
+    return body + FAST_EXIT_ADD
+
+
+# Trial: parallel export (issue #24; proposed upstream in https://github.com/leanprover/lean4export/issues/62). Two
+# commits on top of lean4export: #61 (alonbase, a smaller object cache) and abhiapsunde's parallel walk and merge. They
+# are pinned by hash, so what gets built can't change under us. Upstream measured the full proof on 16 cores: 1 h 54 m
+# with #61 alone, 28 m with both, the same sha256, 89 GB peak memory (one run each, one computer).
+PARALLEL_REPO = "https://github.com/abhiapsunde/lean4export"
+PARALLEL_COMMIT = "73d9ad9b12ff10a40e5b7a8fcb70f038e163fcc3"
+PARALLEL_FILES = ["Export.lean", "Export", "Main.lean"]        # the exporter's sources; not its tests or toolchain
+
+
+# The parallel path's version of the fix in issue #24: don't free the merge thread's tables just before the process
+# ends. Exiting early is not enough here: the Lean compiler releases the tables after their last use, which comes before
+# an exit call added at this spot. `Runtime.forget` keeps a reference for good, so they are never freed one by one and
+# the operating system reclaims the memory when the process exits.
+PARALLEL_END = "      finishOutputG : MB Unit).run {}\n"
+PARALLEL_FORGET = ("      finishOutputG\n"
+                   "      Runtime.forget (← get) : MB Unit).run {}\n")
+
+
+def patch_parallel_forget(par_lean: str):
+    """The parallel exporter's Export/Par.lean keeping its tables until the process ends, or None if the file does not
+    fit."""
+    if par_lean.count(PARALLEL_END) != 1:
+        return None
+    return par_lean.replace(PARALLEL_END, PARALLEL_FORGET)
+
+
+def apply_parallel(src: Path):
+    """Put the two pinned commits' source changes onto the checkout of EXPORTER_TAG in `src`. They were written for a
+    newer lean4export, so they are applied as a diff (`git apply` takes all of it or nothing)."""
+    git = ["git", "-C", src]
+    if run([*git, "fetch", "-q", "--depth", "3", PARALLEL_REPO, PARALLEL_COMMIT]).returncode != 0:
+        raise Fail(f"could not download the parallel exporter from {PARALLEL_REPO}; run export without --parallel")
+    d = run([*git, "diff", "--binary", f"{PARALLEL_COMMIT}~2", PARALLEL_COMMIT, "--", *PARALLEL_FILES],
+            capture_output=True)
+    if d.returncode != 0 or not d.stdout or run([*git, "apply"], input=d.stdout).returncode != 0:
+        raise Fail(f"the parallel changes do not apply to lean4export {EXPORTER_TAG}; run export without --parallel")
+    par = src / "Export" / "Par.lean"
+    patched = patch_parallel_forget(par.read_text())
+    if patched is None:
+        raise Fail("the parallel exporter's Export/Par.lean is not the one the cleanup fix fits; "
+                   "run export without --parallel")
+    par.write_text(patched)
+
+
+def exporter_name(a) -> str:
+    return f"lean4export {EXPORTER_TAG}" + (f" + parallel {PARALLEL_COMMIT[:8]}" if getattr(a, "parallel", False) else "")
 
 
 def exporter_command(ctx: Ctx, a) -> list:
@@ -1924,7 +2609,12 @@ def exporter_command(ctx: Ctx, a) -> list:
     exporter built the old way is never reused."""
     if getattr(a, "exporter", None):                         # testing: a stand-in exporter
         return [a.exporter, "Main", "--", *EXPORT_TARGETS]
-    src = ctx.home / "tools" / f"lean4export-{EXPORTER_TAG}-lean-{TOOLCHAIN.rsplit(':', 1)[-1]}"
+    parallel = bool(getattr(a, "parallel", False))
+    # export's default is on (matched the reference, issue #24); the parallel exporter has its own version of that fix
+    fast = bool(getattr(a, "fast_exit", False)) and not parallel
+    variant = "-fastexit" if fast else f"-parallel-{PARALLEL_COMMIT[:8]}-forget" if parallel else ""
+    src = ctx.home / "tools" / (f"lean4export-{EXPORTER_TAG}-lean-{TOOLCHAIN.rsplit(':', 1)[-1]}"
+                                + variant)   # never mixed up with the unpatched build
     exe = src / ".lake/build/bin/lean4export"
     if not exe.exists():
         if not src.exists():
@@ -1934,6 +2624,19 @@ def exporter_command(ctx: Ctx, a) -> list:
                 shutil.rmtree(tmp, ignore_errors=True)
                 raise Fail(f"could not download lean4export {EXPORTER_TAG} from {EXPORTER_REPO}")
             (tmp / "lean-toolchain").write_text(TOOLCHAIN + "\n")    # build with the proof's Lean (see above)
+            if fast:
+                patched = patch_fast_exit((tmp / "Main.lean").read_text())
+                if patched is None:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    raise Fail(f"lean4export {EXPORTER_TAG}'s Main.lean is not the one the fast exit fits; "
+                               "run export --no-fast-exit")
+                (tmp / "Main.lean").write_text(patched)
+            if parallel:
+                try:
+                    apply_parallel(tmp)
+                except Fail:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    raise
             tmp.rename(src)
         tc = toolchain_of(src)
         if tc != TOOLCHAIN:
@@ -2053,27 +2756,35 @@ def tree_memory_gb(root: int) -> float:
 
 
 def fmt_dur(t: float) -> str:
-    t = int(t)
-    return f"{max(1, round(t / 60))} m" if t < 3600 else f"{t // 3600} h {round(t % 3600 / 60)} m"
+    m = max(1, round(int(t) / 60))                # whole minutes first, so 7170 s is "2 h 0 m", never "1 h 60 m"
+    return f"{m} m" if m < 60 else f"{m // 60} h {m % 60} m"
 
 
 EXPORT_QUIET_SECONDS = 60     # no output for this long: say so instead of a frozen "about 1 m left"
+EXPORT_ETA_AFTER = 60         # seconds of output before the first "about N left" (too early, the speed is noise)
+
+
+def export_left(n: int, total: int, out_seconds: float):
+    """Seconds left, from the speed since the exporter's FIRST output: it first loads the proof for a while and says
+    nothing, and counting that silence made the estimate huge at the start (a volunteer, issue #9)."""
+    return (total - n) / (n / out_seconds) if n and out_seconds >= EXPORT_ETA_AFTER and n < total else None
 
 
 def stream_export(ctx: Ctx, cmd: list, log: Path, sink=None, on_progress=None) -> tuple:
     """Run the exporter in the build folder at nice 19 and read its stdout straight into sha256 and a byte counter
-    (and into `sink`, a checker's stdin, if given). Nothing is written to disk. -> (exit code, sha256, bytes).
+    (and into `sink`, recheck's saved export file, if given). Without a sink nothing is written to disk. -> (exit code, sha256, bytes).
     A reader thread takes whatever output is there (not whole 1 MB pieces), and the progress line, the progress file
     and the leaderboard updates keep ticking every second even while the exporter is silent (a volunteer, 2026-11-23:
     the screen froze at 99.996% because the last 2.4 MB could not show until the exporter exited)."""
     import queue
     h, n = hashlib.sha256(), 0
-    print("  $ " + shlex.join(map(str, cmd)) + f"   (in {ctx.folder}; output hashed, not stored)", file=sys.stderr)
+    print("  $ " + shlex.join(map(str, cmd)) + f"   (in {ctx.folder}; output hashed"
+          + (", saved for the checkers)" if sink is not None else ", not stored)"), file=sys.stderr)
     with open(log, "ab") as lf:
         p = subprocess.Popen(["nice", "-n", "19"] + list(map(str, cmd)), cwd=ctx.folder, stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=lf, env=lean_env())
     t0 = time.time()
-    st = {"peak": 0.0, "next_mem": 0.0, "next_print": 0.0, "pct": -1, "last_out": t0, "quiet_said": 0}
+    st = {"peak": 0.0, "next_mem": 0.0, "next_print": 0.0, "pct": -1, "last_out": t0, "quiet_said": 0, "first_out": None}
     tty = sys.stderr.isatty()
     q = queue.Queue(maxsize=64)
 
@@ -2089,8 +2800,9 @@ def stream_export(ctx: Ctx, cmd: list, log: Path, sink=None, on_progress=None) -
     def show(final=False):
         now = time.time()
         el, quiet = now - t0, now - st["last_out"]
+        out_el = now - st["first_out"] if st["first_out"] else 0.0   # time since the exporter started writing
         silent = not final and quiet >= EXPORT_QUIET_SECONDS
-        left = (EXPORT_BYTES - n) / (n / el) if n and el >= 60 and n < EXPORT_BYTES and not silent else None
+        left = export_left(n, EXPORT_BYTES, out_el) if not silent else None
         pct = min(100, int(n * 100 / EXPORT_BYTES))
         if on_progress:
             on_progress(n, el, left, st["peak"], final)
@@ -2101,7 +2813,7 @@ def stream_export(ctx: Ctx, cmd: list, log: Path, sink=None, on_progress=None) -
             st["quiet_said"] = qm
         st["pct"], st["next_print"] = pct, now + 1800
         bar = "█" * (pct * 22 // 100) + "░" * (22 - pct * 22 // 100)
-        line = (f"  EXPORTING {pct}%  {bar}  {n / 1e9:,.1f} of {EXPORT_BYTES / 1e9:,.1f} GB · {n / 1e6 / max(el, 1):,.1f} MB/s"
+        line = (f"  EXPORTING {pct}%  {bar}  {n / 1e9:,.1f} of {EXPORT_BYTES / 1e9:,.1f} GB · {n / 1e6 / max(out_el, 1):,.1f} MB/s"
                 + (f" · about {fmt_dur(left)} left" if left else "")
                 + (f" · no output for {fmt_dur(quiet)}, the exporter is still running" if silent else "")
                 + (f" · memory {st['peak']:,.0f} GB" if st["peak"] else ""))
@@ -2120,6 +2832,7 @@ def stream_export(ctx: Ctx, cmd: list, log: Path, sink=None, on_progress=None) -
             now = time.time()
             if chunk:
                 st["last_out"] = now
+                st["first_out"] = st["first_out"] or now
                 h.update(chunk)
                 n += len(chunk)
                 if sink is not None:
@@ -2128,8 +2841,9 @@ def stream_export(ctx: Ctx, cmd: list, log: Path, sink=None, on_progress=None) -
                 st["peak"], st["next_mem"] = max(st["peak"], tree_memory_gb(p.pid)), now + 5
             if now >= next_show:
                 show(); next_show = now + 1
-    except BrokenPipeError:                                   # the checker stopped reading
-        p.kill()
+    except BaseException:                                     # a full disk, Ctrl-C, ...: stop the exporter, or
+        p.kill()                                              # it blocks on a full pipe and p.wait() never returns
+        raise
     finally:
         rc = p.wait()
         p.stdout.close()
@@ -2146,7 +2860,12 @@ def cmd_export(ctx: Ctx, a):
             return 0
         print(f"export check FAILED: {r.get('error')}", file=sys.stderr)
         return 1
+    st = ctx.conf().get("pr") or {}
     rec = whole_build(ctx, a, "export")
+    if st.get("build_id") == rec["build_id"] and st.get("final_sent"):
+        raise Fail("this build's final record was already sent, so an export result can't reach the leaderboard any "
+                   "more (the bot takes no updates after `finish`)")
+    keep_awake()
     cmd = exporter_command(ctx, a)
     ctx.logs.mkdir(parents=True, exist_ok=True)
     log = ctx.logs / "export.log"
@@ -2154,6 +2873,9 @@ def cmd_export(ctx: Ctx, a):
     warn = export_memory_warning(total_ram_gb())
     if warn:
         print(warn, file=sys.stderr)
+    if getattr(a, "parallel", False):
+        print("trial: parallel export on all cores. The memory figures above are for the standard exporter; upstream "
+              "measured a peak of 89 GB with this one (one computer). The result is compared with the reference as usual.")
     t0 = time.time()
     pf = ctx.home / "export-progress.json"
     base = {"build_id": rec["build_id"], "olean_digest": rec["olean_digest"]}
@@ -2179,11 +2901,15 @@ def cmd_export(ctx: Ctx, a):
     lv = levels_state(ctx, rec["olean_digest"])
     advance = bool(sign_when_done(ctx)) and match
     same = (lv.get("export") or {}).get("sha256") == sha
-    ctx.set_conf(levels={"build_id": rec["build_id"], "olean_digest": rec["olean_digest"],
-                         "export": {"sha256": sha, "bytes": n, "exporter": f"lean4export {EXPORTER_TAG}",
-                                    "seconds": int(time.time() - t0), "when": iso(time.time())},
-                         "checkers": lv.get("checkers", []) if same else [],
-                         "sign_statement": (bool(lv.get("sign_statement")) and same or advance) and match})
+    if not match and (lv.get("export") or {}).get("sha256") == EXPORT_SHA256:
+        # an earlier export here matched: keep it (and Level 2, checkers, signature); this run is only reported
+        print("this export did not match, but an earlier one on this build did: keeping that result (Level 2 stays)")
+    else:
+        ctx.set_conf(levels={"build_id": rec["build_id"], "olean_digest": rec["olean_digest"],
+                             "export": {"sha256": sha, "bytes": n, "exporter": exporter_name(a),
+                                        "seconds": int(time.time() - t0), "when": iso(time.time())},
+                             "checkers": lv.get("checkers", []) if same else [],
+                             "sign_statement": (bool(lv.get("sign_statement")) and same or advance) and match})
     print(f"export sha256 {sha}\nexport bytes  {n:,}")
     if auto:
         autosubmit(ctx, a, "export done")                   # the leaderboard shows the result (and Level 2 if it matches)
@@ -2199,6 +2925,8 @@ def cmd_export(ctx: Ctx, a):
     print("Level 2: matches the reference export (Andrew Sutherland, https://math.mit.edu/~drew/grh).")
     out = write_record(ctx, make_record(ctx, a))
     print(f"record with export_sha256: {out}")
+    if advance:
+        share_nudge(ctx, "signed")
     return 0
 
 
@@ -2231,8 +2959,95 @@ def export_memory_warning(ram_gb: float):
             f"slow down a lot as memory fills (on a 125 GB computer the final 0.01% took almost 2 hours).{tip}")
 
 
+def saved_export_path(ctx: Ctx) -> Path:
+    return ctx.home / "export" / f"proof-{EXPORT_SHA256[:16]}.ndjson"
+
+
+def saved_export(ctx: Ctx, a) -> Path:
+    """The reference export as a file, for the checkers. Neither checker reads it from a pipe the way we used to send
+    it (con-leche takes FILE.ndjson, nanoda a config that names the file), and piping kept the exporter (~145 GB) and
+    the checker in memory together, which hung nanoda even on 256 GB (a volunteer, issue #9). So: export once to
+    disk, prove it is the reference, then run each checker alone. Kept, so the second checker reuses it."""
+    path = saved_export_path(ctx)
+    if path.exists():
+        if path.stat().st_size == EXPORT_BYTES:
+            print(f"using the saved export {path} (checking its sha256 first)")
+            if sha256_file(path) == EXPORT_SHA256:
+                return path
+        print(f"the saved export {path} is not the reference export; making it again")
+        path.unlink()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    part = path.with_name(path.name + ".partial")
+    part.unlink(missing_ok=True)                               # left by a run that was killed: it is our own space
+    free = shutil.disk_usage(path.parent).free / 1e9
+    need = EXPORT_BYTES / 1e9 + MIN_FREE_GB
+    if free < need:
+        raise Fail(f"recheck saves the export ({EXPORT_BYTES / 1e9:,.1f} GB) to {path.parent} first, and "
+                   f"{free:,.0f} GB are free there (needs about {need:,.0f} GB). Free some disk and try again.")
+    print(f"exporting once to {path} ({EXPORT_BYTES / 1e9:,.1f} GB on disk; the checkers then read it from there)")
+    if warn := export_memory_warning(total_ram_gb()):
+        print(warn, file=sys.stderr)
+    try:
+        with open(part, "wb") as f:
+            rc, sha, n = stream_export(ctx, exporter_command(ctx, a), ctx.logs / "export.log", sink=f)
+        if rc != 0 or sha != EXPORT_SHA256 or n != EXPORT_BYTES:
+            raise Fail(f"the export was not the reference export (sha256 {sha}, {n:,} bytes, exporter exit {rc}); "
+                       f"nothing recorded. See {ctx.logs / 'export.log'}")
+        part.rename(path)
+    finally:
+        part.unlink(missing_ok=True)
+    return path
+
+
+def checker_command(name: str, exe: str, export: Path, extra: list, cpus: int) -> list:
+    """How each checker is told where the export is (their READMEs, 2026-11-23): con-leche takes the file as its last
+    argument; nanoda_bin takes only a JSON config file, which we write next to the export."""
+    if name == "con-leche":
+        return [exe, *extra, "--", str(export)]
+    if extra:
+        raise Fail("nanoda takes no command-line arguments, only its config file; drop --checker-args")
+    cfg = export.with_name("nanoda-config.json")
+    cfg.write_text(json.dumps({"export_file_path": str(export), "use_stdin": False, "num_threads": cpus,
+                               "permitted_axioms": EXPECTED_AXIOMS, "unpermitted_axiom_hard_error": False,
+                               "nat_extension": True, "string_extension": True}, indent=2) + "\n")
+    return [exe, str(cfg)]
+
+
+def checker_git_version(name: str, exe: str) -> str:
+    """`nanoda <commit>` when the binary sits inside the clone it was built in (nanoda_bin has no --version)."""
+    d, project = str(Path(exe).resolve().parent), {"nanoda": "nanoda_lib", "con-leche": "con-leche"}[name]
+    try:
+        url = subprocess.run(["git", "-C", d, "remote", "get-url", "origin"], capture_output=True, text=True, timeout=10)
+        if url.returncode != 0 or project not in url.stdout:   # inside some other repo: its commit says nothing
+            return ""
+        r = subprocess.run(["git", "-C", d, "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True, timeout=10)
+        return f"{name} {r.stdout.strip()}" if r.returncode == 0 and r.stdout.strip() else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def find_checker(ctx: Ctx, name: str, given=None) -> str:
+    if given:
+        return given
+    names = [name, "nanoda_bin"] if name == "nanoda" else [name]       # nanoda's cargo build makes `nanoda_bin`
+    for n in names:
+        if w := shutil.which(n):
+            return w
+        if (ctx.home / "tools/bin" / n).exists():
+            return str(ctx.home / "tools/bin" / n)
+    return str(ctx.home / "tools/bin" / name)
+
+
+def keep_awake():
+    """macOS: no idle sleep while this command runs (export and recheck take hours; only the build had this)."""
+    if IS_MAC and shutil.which("caffeinate"):
+        subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def cmd_recheck(ctx: Ctx, a):
-    """Level 3 (optional): stream the export into an independent checker (it reads the export on stdin)."""
+    """Level 3 (optional): run an independent checker on the saved reference export."""
+    keep_awake()
     name = "nanoda" if a.nanoda else "con-leche"
     need, ram = CHECKERS[name], total_ram_gb()
     if ram < need:
@@ -2242,44 +3057,52 @@ def cmd_recheck(ctx: Ctx, a):
     lv = levels_state(ctx, rec["olean_digest"])
     if (lv.get("export") or {}).get("sha256") != EXPORT_SHA256:
         raise Fail("recheck needs Level 2 first: run `riemann-at-home export` and reproduce the reference export")
-    exe = a.checker or shutil.which(name) or str(ctx.home / "tools/bin" / name)
+    exe = find_checker(ctx, name, a.checker)
     if not Path(exe).exists():
         raise Fail(f"{name} is not installed. Build it from its project, then put it at "
                    f"{ctx.home / 'tools/bin' / name} or pass --checker PATH")
     version = a.checker_version
-    if not version:
+    if not version and name == "con-leche":                    # nanoda_bin has no --version (config file only)
         try:
             v = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=30)
             version = (v.stdout or v.stderr).strip().splitlines()[0][:64] if v.returncode == 0 else ""
         except (OSError, subprocess.TimeoutExpired, IndexError):
             version = ""
-    version = version or "unknown"
-    log = ctx.logs / f"recheck-{name}.log"
+    version = version or checker_git_version(name, exe) or "unknown"
     ctx.logs.mkdir(parents=True, exist_ok=True)
-    ccmd = [exe] + shlex.split(a.checker_args or "")
+    export = saved_export(ctx, a)                              # the exporter has exited: its memory is free again
+    log = ctx.logs / f"recheck-{name}.log"
+    ccmd = checker_command(name, exe, export, shlex.split(a.checker_args or ""), os.cpu_count() or 1)
     print(f"re-checking the export with {name} {version} (needs about {need} GB of memory; takes hours)")
-    print("  $ " + shlex.join(ccmd) + "   (export on stdin)", file=sys.stderr)
+    print("  $ " + shlex.join(ccmd), file=sys.stderr)
     t0 = time.time()
     with open(log, "ab") as lf:
-        chk = subprocess.Popen(ccmd, cwd=ctx.home, stdin=subprocess.PIPE, stdout=lf, stderr=subprocess.STDOUT)
-        rc, sha, n = stream_export(ctx, exporter_command(ctx, a), ctx.logs / "export.log", sink=chk.stdin)
         try:
-            chk.stdin.close()
-        except BrokenPipeError:
-            pass
-        crc = chk.wait()
+            crc = subprocess.run(ccmd, cwd=ctx.home, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT).returncode
+        except OSError as e:
+            raise Fail(f"could not start {name} ({exe}): {e}. The saved export stays at {export}.")
     secs = int(time.time() - t0)
-    if sha != EXPORT_SHA256 or n != EXPORT_BYTES:
-        raise Fail(f"the export streamed to {name} was not the reference export (sha256 {sha}, {n:,} bytes, exporter "
-                   f"exit {rc}); nothing recorded. See {ctx.logs / 'export.log'}")
+    if crc < 0:                                                # killed by a signal: no verdict, nothing recorded
+        sig = -crc
+        why = " (usually: the computer ran out of memory)" if sig == 9 else ""
+        raise Fail(f"{name} was stopped by signal {sig}{why} after {secs / 3600:.1f} h, before it gave a verdict; "
+                   f"nothing recorded. Log: {log}. The saved export stays at {export}, so a rerun skips the export.")
+    if name == "con-leche" and crc not in (0, 1):             # arena convention: 1 rejected, 2 declined, 3 error
+        what = "declined (it does not support something in the export)" if crc == 2 else "stopped with an error"
+        raise Fail(f"con-leche {what}, exit {crc}, after {secs / 3600:.1f} h: no verdict on the proof, nothing recorded. "
+                   f"Log: {log}. The saved export stays at {export}.")
     result = "accept" if crc == 0 else "reject"
     entry = {"name": name, "version": version, "result": result, "seconds": secs}
     lv = levels_state(ctx, rec["olean_digest"])
     lv["checkers"] = [e for e in lv.get("checkers", []) if e.get("name") != name] + [entry]
     ctx.set_conf(levels=lv)
-    print(f"{name}: {result.upper()} in {secs / 3600:.1f} h (log: {log})")
+    print(f"{name}: {result.upper()} in {secs / 3600:.1f} h (exit {crc}; log: {log})")
     out = write_record(ctx, make_record(ctx, a))
     print(f"{'Level 3. ' if result == 'accept' else ''}record with checkers: {out}")
+    send_now(ctx, a, "recheck")
+    other = "con-leche" if name == "nanoda" else "nanoda"
+    print(f"the saved export stays at {export} ({EXPORT_BYTES / 1e9:,.1f} GB) so `recheck --{other}` can reuse it; "
+          f"delete it when you are done: rm {shlex.quote(str(export))}")
     return 0 if result == "accept" else 1
 
 
@@ -2305,7 +3128,8 @@ def cmd_sign(ctx: Ctx, a):
             lvc["sign_statement"] = False
             ctx.set_conf(levels=lvc)
             write_record(ctx, make_record(ctx, a))
-            print("signature withdrawn: new records no longer carry it (the leaderboard drops it at the next update)")
+            print("signature withdrawn: new records no longer carry it")
+            send_now(ctx, a, "signature withdrawn")
         else:
             print("not signed in advance any more")
         return 0
@@ -2340,7 +3164,9 @@ def cmd_sign(ctx: Ctx, a):
     lv["sign_statement"] = True
     ctx.set_conf(levels=lv)
     out = write_record(ctx, make_record(ctx, a))
-    print(f"signed: records now carry \"sign_statement\": true; the next update of this build's PR sends it.\n{out}")
+    print(f"signed: records now carry \"sign_statement\": true\n{out}")
+    send_now(ctx, a, "signed")
+    share_nudge(ctx, "signed")
     return 0
 
 
@@ -2582,7 +3408,7 @@ def set_mode_from_page(ctx: Ctx, mode: str):
     """The page's Full / Gentle / Pause buttons. Only for a build this tool started."""
     if not supervisor(ctx):
         raise Fail("no build started by riemann-at-home is running")
-    ns = argparse.Namespace(gentle=mode == "gentle", full=mode == "full", target="Main", submit_repo=None, submit=False,
+    ns = argparse.Namespace(gentle=mode == "gentle", full=mode == "full", target=None, submit_repo=None, submit=False,
                             test_unofficial_folder=False)
     if mode == "paused":
         return cmd_pause(ctx, ns)
@@ -2677,6 +3503,9 @@ def main(argv=None):
     hidden = argparse.ArgumentParser(add_help=False)
     hidden.add_argument("--folder", help=argparse.SUPPRESS)        # testing: a build folder other than the fixed one
     hidden.add_argument("--logs", help=argparse.SUPPRESS)          # testing / logs of an older build script
+    hidden.add_argument("--proof", choices=list(PROOFS) + ["both"],
+                        help="which proof: 300k (the new one) or 17m (the original); setup also takes both. "
+                             "Default: the one setup chose (17m on a computer set up before setup asked)")
     ap = argparse.ArgumentParser(prog="riemann-at-home", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=TOOL)
@@ -2686,13 +3515,14 @@ def main(argv=None):
     s.add_argument("--parts-url", default=PART_URL, help=argparse.SUPPRESS)
     s.add_argument("--skip-cache", action="store_true", help=argparse.SUPPRESS)
     s.add_argument("--force-cache", action="store_true", help=argparse.SUPPRESS)
+    s.add_argument("--source-url", help=argparse.SUPPRESS)        # testing: clone the 300K source from here
     for name, h in (("build", "start the official build in the background, or change its speed"),
                     ("resume", "continue a paused build (or start a stopped one)")):
         b = sub.add_parser(name, parents=[hidden], help=h)
         g = b.add_mutually_exclusive_group()
         g.add_argument("--gentle", action="store_true", help="background priority: only spare CPU (default)")
         g.add_argument("--full", action="store_true", help="all cores (still lowest priority, nice 19)")
-        b.add_argument("--target", default="Main", help=argparse.SUPPRESS)
+        b.add_argument("--target", help=argparse.SUPPRESS)          # default: the proof's own
         b.add_argument("--submit", action="store_true", help="update this build's pull request about every 10 min")
         b.add_argument("--submit-repo", help=argparse.SUPPRESS)       # older: dry runs into a given clone
         b.add_argument("--test-unofficial-folder", action="store_true", help=argparse.SUPPRESS)
@@ -2723,6 +3553,7 @@ def main(argv=None):
     f.add_argument("--repo", help=argparse.SUPPRESS)
     f.add_argument("--login"); f.add_argument("--upstream")
     f.add_argument("--dry-run", action="store_true", help="print what it would do; change nothing")
+    f.add_argument("--force", action="store_true", help="finish even if it would lose the axiom check or export result")
     f.add_argument("--no-gh-check", action="store_true", help=argparse.SUPPRESS)
     f.add_argument("--test-unofficial-folder", action="store_true", help=argparse.SUPPRESS)
     nm = sub.add_parser("name", parents=[hidden], help="the name the page shows instead of your GitHub login")
@@ -2738,12 +3569,18 @@ def main(argv=None):
                         help="Level 2: hash the proof export (lean4export, streamed, never stored) against the reference")
     ex.add_argument("--check", action="store_true",
                     help="just check that the exporter works on this computer (exports one compiled module, about a minute)")
+    ex.add_argument("--parallel", action="store_true",
+                    help="trial: export on several cores (lean4export#62), without the memory cleanup at the end; "
+                         "the output must match the same reference")
+    ex.add_argument("--fast-exit", action=argparse.BooleanOptionalAction, default=True,
+                    help="skip lean4export's slow memory cleanup after the last byte (issue #24); same output. "
+                         "On by default since a full export matched the reference with it; --no-fast-exit turns it off")
     rc = sub.add_parser("recheck", parents=[hidden, lvl], help="Level 3 (optional): re-check the export independently")
     g = rc.add_mutually_exclusive_group(required=True)
     g.add_argument("--nanoda", action="store_true", help=f"nanoda (needs about {CHECKERS['nanoda']} GB of memory)")
     g.add_argument("--con-leche", action="store_true", help=f"con-leche (needs about {CHECKERS['con-leche']} GB of memory)")
     rc.add_argument("--checker", help="path to the checker binary (default: on PATH or ~/.riemann-at-home/tools/bin)")
-    rc.add_argument("--checker-args", help="extra arguments for the checker (it reads the export on stdin)")
+    rc.add_argument("--checker-args", help="extra arguments for con-leche (nanoda takes only its config file)")
     rc.add_argument("--checker-version", help="version to record (default: `CHECKER --version`)")
     sg = sub.add_parser("sign", parents=[hidden, lvl], help="sign the joint statement (Level 2 or 3)")
     sgm = sg.add_mutually_exclusive_group()
@@ -2753,11 +3590,18 @@ def main(argv=None):
     y.add_argument("--test-unofficial-folder", action="store_true")
     sub.add_parser("_autosubmit_loop", parents=[hidden])  # internal: interval loop for a build started by an older version
     x = sub.add_parser("_run", parents=[hidden])   # internal: the background supervisor
-    x.add_argument("--target", default="Main")
+    x.add_argument("--target")
     x.add_argument("--test-unofficial-folder", action="store_true")
     a = ap.parse_args(argv)
+    if a.cmd == "export" and a.parallel and not a.fast_exit:
+        ap.error("--no-fast-exit is for the standard exporter only; leave it out with --parallel")
     try:
+        if a.proof == "both" and a.cmd != "setup":
+            raise Fail("--proof both is for setup only; other commands take --proof 300k or --proof 17m")
         ctx = Ctx(a)
+        if a.cmd in ("export", "recheck", "sign") and not ctx.p["levels"]:
+            raise Fail(LEVELS_ONLY_17M + (" (This computer's default is the 300K proof; for the 17M one add --proof 17m.)"
+                                          if getattr(a, "proof", None) is None else ""))
         fn = {"setup": cmd_setup, "build": cmd_build, "pause": cmd_pause, "resume": cmd_resume, "stop": cmd_stop,
               "status": cmd_status, "sweep": cmd_sweep, "update": cmd_update, "record": cmd_record, "finish": cmd_finish, "name": cmd_name, "submit": cmd_submit, "page": cmd_page,
               "export": cmd_export, "recheck": cmd_recheck, "sign": cmd_sign, "_autosubmit": cmd_autosubmit,
